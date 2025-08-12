@@ -6,9 +6,13 @@ import uuid
 from typing import Dict, Any, List, Optional
 
 import httpx
-import asyncpg
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
+
+# psycopg (бинарные колёса, не компилируется)
+import psycopg
+from psycopg_pool import AsyncConnectionPool
+from psycopg.types.json import Json
 
 # -----------------------------
 # ENV
@@ -25,45 +29,60 @@ MODEL_NAME          = os.getenv("MODEL_NAME", "gpt-4o-mini")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # -----------------------------
-# DB
+# DB (psycopg + async pool)
 # -----------------------------
-POOL: Optional[asyncpg.Pool] = None
+POOL: Optional[AsyncConnectionPool] = None
 
-DDL = """
-CREATE TABLE IF NOT EXISTS suggestion_sessions (
-    id UUID PRIMARY KEY,
-    chat_id BIGINT NOT NULL,
-    reply_to BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    s1 TEXT NOT NULL,
-    s2 TEXT NOT NULL,
-    s3 TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_suggestion_sessions_created ON suggestion_sessions(created_at);
-
-CREATE TABLE IF NOT EXISTS edit_waits (
-    key TEXT PRIMARY KEY,
-    payload JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
+DDL_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS suggestion_sessions (
+        id UUID PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        reply_to BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        s1 TEXT NOT NULL,
+        s2 TEXT NOT NULL,
+        s3 TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_suggestion_sessions_created ON suggestion_sessions(created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS edit_waits (
+        key TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+]
 
 async def init_db():
+    """Создаёт пул и таблицы. Автокоммит включён, чтобы не возиться с транзакциями для MVP."""
     global POOL
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is empty")
     if POOL is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is empty")
-        POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        async with POOL.acquire() as conn:
-            await conn.execute(DDL)
+        POOL = AsyncConnectionPool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            open=True,
+            kwargs={"autocommit": True},
+        )
+        async with POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                for stmt in DDL_STATEMENTS:
+                    await cur.execute(stmt)
 
 async def db_execute(query: str, *args):
-    async with POOL.acquire() as conn:
-        return await conn.execute(query, *args)
+    async with POOL.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(query, args if args else None)
 
 async def db_fetchrow(query: str, *args):
-    async with POOL.acquire() as conn:
-        return await conn.fetchrow(query, *args)
+    async with POOL.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(query, args if args else None)
+            return await cur.fetchone()
 
 # -----------------------------
 # Telegram helpers
@@ -189,8 +208,10 @@ async def set_webhook_url(admin: str, url: str):
     if admin != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="forbidden")
     async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(f"{TELEGRAM_API}/setWebhook",
-                             params={"url": url, "allowed_updates": json.dumps(["message", "callback_query"])})
+        r = await client.get(
+            f"{TELEGRAM_API}/setWebhook",
+            params={"url": url, "allowed_updates": json.dumps(["message", "callback_query"])}
+        )
         r.raise_for_status()
         return r.json()
 
@@ -212,12 +233,15 @@ async def webhook(secret: str, request: Request):
         sid    = data.get("sid")
         idx    = int(data.get("i", 0))
 
-        row = await db_fetchrow("SELECT chat_id, reply_to, s1, s2, s3 FROM suggestion_sessions WHERE id=$1", uuid.UUID(sid))
+        row = await db_fetchrow(
+            "SELECT chat_id, reply_to, s1, s2, s3 FROM suggestion_sessions WHERE id=%s",
+            sid
+        )
         if not row:
             await send_message(cbq["message"]["chat"]["id"], "Сессия устарела. Сгенерируйте подсказки заново.")
             return {"ok": True}
 
-        chat_id, reply_to, s1, s2, s3 = row[0], row[1], row[2], row[3], row[4]
+        chat_id, reply_to, s1, s2, s3 = row
         suggestions = [s1, s2, s3]
 
         if action == "send":
@@ -231,9 +255,9 @@ async def webhook(secret: str, request: Request):
             wait_key = f"wait:{curator_chat_id}:{curator_id}"
             payload = {"chat_id": chat_id, "reply_to": reply_to}
             await db_execute(
-                "INSERT INTO edit_waits(key, payload) VALUES($1,$2) "
+                "INSERT INTO edit_waits(key, payload) VALUES(%s,%s) "
                 "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, created_at=now()",
-                wait_key, json.dumps(payload)
+                wait_key, Json(payload)
             )
             await send_message(curator_chat_id, "Пришлите одним сообщением текст правки — я отправлю его в рабочий чат реплаем к исходному.")
             return {"ok": True}
@@ -266,10 +290,10 @@ async def webhook(secret: str, request: Request):
     if SUGGESTIONS_CHAT_ID and chat_id == SUGGESTIONS_CHAT_ID and text:
         curator_id = from_user.get("id")
         wait_key = f"wait:{SUGGESTIONS_CHAT_ID}:{curator_id}"
-        row = await db_fetchrow("SELECT payload FROM edit_waits WHERE key=$1", wait_key)
+        row = await db_fetchrow("SELECT payload FROM edit_waits WHERE key=%s", wait_key)
         if row:
-            payload = json.loads(row[0])
-            await db_execute("DELETE FROM edit_waits WHERE key=$1", wait_key)
+            payload = row[0]  # psycopg вернёт dict для JSONB
+            await db_execute("DELETE FROM edit_waits WHERE key=%s", wait_key)
             await send_message(payload["chat_id"], text, reply_to=payload["reply_to"])
             return {"ok": True}
 
@@ -281,8 +305,8 @@ async def webhook(secret: str, request: Request):
         suggestions = await llm_suggestions(text)
         sid = uuid.uuid4()
         await db_execute(
-            "INSERT INTO suggestion_sessions(id, chat_id, reply_to, s1, s2, s3) VALUES($1,$2,$3,$4,$5,$6)",
-            sid, chat_id, orig_message_id, suggestions[0], suggestions[1], suggestions[2]
+            "INSERT INTO suggestion_sessions(id, chat_id, reply_to, s1, s2, s3) VALUES(%s,%s,%s,%s,%s,%s)",
+            str(sid), chat_id, orig_message_id, suggestions[0], suggestions[1], suggestions[2]
         )
 
         keyboard = {
