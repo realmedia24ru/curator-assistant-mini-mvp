@@ -30,6 +30,8 @@ SUGGESTIONS_CHAT_ID = int(os.getenv("SUGGESTIONS_CHAT_ID", "0") or 0)
 OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME          = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
+AGG_WINDOW          = int(os.getenv("AGG_WINDOW", "8"))  # секунд для склейки сообщений
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # -----------------------------
@@ -60,7 +62,7 @@ DDL_STATEMENTS = [
 ]
 
 async def init_db():
-    """Создаём пул и таблицы. Без deprecated open=True — открываем пул отдельно."""
+    """Создаём пул и таблицы (без deprecated open=True)."""
     global POOL
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty")
@@ -69,6 +71,7 @@ async def init_db():
             DATABASE_URL,
             min_size=1,
             max_size=5,
+            open=False,
             kwargs={"autocommit": True},
         )
         await POOL.open()
@@ -89,8 +92,11 @@ async def db_fetchrow(query: str, *args):
             return await cur.fetchone()
 
 # -----------------------------
-# Telegram helpers
+# Helpers
 # -----------------------------
+def html_escape(s: str) -> str:
+    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
 async def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TELEGRAM_API}/{method}"
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -129,115 +135,153 @@ async def safe_delete_message(chat_id: int, message_id: int):
     except Exception as e:
         print("[TG DELETE ERROR]", e)
 
+async def copy_message(to_chat: int, from_chat: int, msg_id: int):
+    try:
+        await tg_call("copyMessage", {"chat_id": to_chat, "from_chat_id": from_chat, "message_id": msg_id})
+    except Exception as e:
+        print("[TG COPY ERROR]", e)
+
+# Определение типа медиа и текстового маркера для агрегатора
+def media_marker(msg: Dict[str, Any]) -> Optional[str]:
+    mapping = [
+        ("photo", "[фото]"),
+        ("video", "[видео]"),
+        ("animation", "[gif]"),
+        ("document", "[документ]"),
+        ("audio", "[аудио]"),
+        ("voice", "[войс]"),
+        ("video_note", "[кружок]"),
+        ("sticker", "[стикер]"),
+    ]
+    for key, label in mapping:
+        if key in msg:
+            # если это часть альбома — добавим пометку
+            if "media_group_id" in msg:
+                return f"{label} (альбом)"
+            return label
+    return None
+
 # -----------------------------
-# LLM suggestions (3 варианта) с устойчивым парсером
+# LLM: один «творческий» вариант
 # -----------------------------
-async def llm_suggestions(user_text: str) -> List[str]:
-    # если ключа нет — сразу умный фолбэк
+async def llm_one_variant(user_text: str) -> str:
     if not OPENAI_API_KEY:
-        return rule_suggestions(user_text)
+        return "Понимаю запрос. Давайте точечно: опишите, что сейчас в практике важнее — покажу, с чего начать именно вам."
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content":
-                f"Сообщение студента: {user_text}\n"
-                f"Контекст курса: {COURSE_HINTS}\n"
-                f"Ответь строго JSON-списком из трёх строк без комментариев и преамбул."}
+            {"role": "system", "content":
+                "Ты ментор для современных художников. Отвечай кратко, по делу, дружелюбно. "
+                "Дай 1 вариант (2–3 коротких предложения), без плейсхолдеров, но с конкретными шагами/навигацией."},
+            {"role": "user", "content": f"Запрос художника: {user_text}"}
         ],
-        "temperature": 0.4,
-        "max_tokens": 400
+        "temperature": 0.6,
+        "max_tokens": 200
     }
-
-    def _parse_suggestions(raw: str) -> List[str]:
-        if not raw:
-            return []
-
-        raw = raw.strip()
-
-        # 1) Вытянуть из код-фенса ```json ... ```
-        m = re.search(r"```(?:json)?\s*(.*?)```", raw, flags=re.S | re.I)
-        if m:
-            raw = m.group(1).strip()
-
-        # 2) Если это уже JSON — пробуем распарсить
-        if raw and raw[0] in "[{":
-            try:
-                obj = json.loads(raw)
-                if isinstance(obj, dict) and "s" in obj and isinstance(obj["s"], list):
-                    return [str(x).strip() for x in obj["s"]][:3]
-                if isinstance(obj, list):
-                    return [str(x).strip() for x in obj][:3]
-            except Exception:
-                pass
-
-        # 3) Попытка вырезать первый массив [...] из текста
-        i, j = raw.find("["), raw.rfind("]")
-        if i != -1 and j != -1 and j > i:
-            snippet = raw[i:j+1]
-            try:
-                arr = json.loads(snippet)
-                if isinstance(arr, list):
-                    return [str(x).strip() for x in arr][:3]
-            except Exception:
-                pass
-
-        # 4) Фолбэк: берём первые 3 «строки/буллета»
-        lines = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            line = re.sub(r"^(\d+[\).\:-]|\-|\*|\•)\s*", "", line)
-            lines.append(line)
-            if len(lines) >= 3:
-                break
-        return lines[:3]
-
     async with httpx.AsyncClient(timeout=40.0) as client:
         try:
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
-            raw = (data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")).strip()
-            suggestions = _parse_suggestions(raw)
-
-            # нормализуем до 3 вариантов
-            out: List[str] = []
-            for s in suggestions[:3]:
-                s = str(s).replace("\n\n", "\n").strip()
-                out.append(s[:600])  # держим коротко, чтобы всё сообщение <4096
-            while len(out) < 3:
-                out.append("Уточните, пожалуйста, детали — помогу пошагово.")
-            return out[:3]
-
+            raw = (data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+            m = re.search(r"```(?:.*?\n)?(.*?)```", raw, flags=re.S)
+            if m:
+                raw = m.group(1).strip()
+            text = raw.split("\n\n")[0].strip()
+            if not text:
+                text = raw.strip()
+            return text[:600]
         except Exception as e:
-            try:
-                print("[LLM RAW FAIL]", raw[:200] if 'raw' in locals() else "<no content>")
-            except Exception:
-                pass
-            print("[LLM ERROR]", e)
-            return rule_suggestions(user_text)
+            print("[LLM ONE ERROR]", e)
+            return "Если кратко: сформулируйте ближайшую цель и вопрос к ней — поможем точечно на встрече или здесь."
+
+# Композит: 2 из базы + 1 из LLM
+async def compose_suggestions(user_text: str) -> List[str]:
+    base = rule_suggestions(user_text)
+    llm3 = await llm_one_variant(user_text)
+    out = [base[0], base[1], llm3]
+    return [s.replace("\n\n","\n").strip()[:600] for s in out]
 
 # -----------------------------
-# Utils
+# Склейка сообщений пользователя (debounce)
 # -----------------------------
-async def gc_db():
-    await db_execute("DELETE FROM suggestion_sessions WHERE created_at < now() - interval '24 hours'")
-    await db_execute("DELETE FROM edit_waits WHERE created_at < now() - interval '2 hours'")
+AGG: Dict[str, Dict[str, Any]] = {}  # key -> {texts:[], first_id:int, sender:dict, timer:Task, chat_id}
 
-# нормализация команд: /cmd и /cmd@username
-def _norm_cmd(t: str) -> str:
-    if not t or not t.startswith("/"):
-        return ""
-    first = t.strip().split()[0]
-    base = first.split("@")[0].lower()
-    return base
+def _agg_key(chat_id: int, user_id: int) -> str:
+    return f"{chat_id}:{user_id}"
+
+async def _agg_fire(key: str):
+    await asyncio.sleep(AGG_WINDOW)
+    state = AGG.pop(key, None)
+    if not state:
+        return
+
+    chat_id = state["chat_id"]
+    user = state["sender"]
+    text_joined = "\n".join([t for t in state["texts"] if t]).strip()
+    if not text_joined:
+        text_joined = "[сообщение без текста]"
+
+    # Подсказки (2 из базы + 1 из LLM)
+    suggestions = await compose_suggestions(text_joined)
+
+    sid = uuid.uuid4()
+    await db_execute(
+        "INSERT INTO suggestion_sessions(id, chat_id, reply_to, s1, s2, s3) VALUES(%s,%s,%s,%s,%s,%s)",
+        str(sid), chat_id, state["first_id"], suggestions[0], suggestions[1], suggestions[2]
+    )
+
+    sugs_display = [expand_links(s) for s in suggestions]
+
+    # кликабельное имя
+    sender_id = user.get("id")
+    sender_name = user.get("first_name") or user.get("username") or "Участник"
+    sender_link = f'<a href="tg://user?id={sender_id}">{html_escape(sender_name)}</a>'
+
+    preview = (
+        f"Новое сообщение в рабочем чате от {sender_link}:\n\n"
+        f"{html_escape(text_joined[:700])}" + ("…" if len(text_joined) > 700 else "") +
+        "\n\nВарианты:\n"
+        f"1) {html_escape(sugs_display[0])}\n\n"
+        f"2) {html_escape(sugs_display[1])}\n\n"
+        f"3) {html_escape(sugs_display[2])}"
+    )
+
+    # Кнопки: на каждый вариант «Отправить» и «✍ Правка»
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "Отправить 1", "callback_data": f"s:{sid}:0"},
+                {"text": "✍ Правка 1",  "callback_data": f"e:{sid}:0"},
+            ],
+            [
+                {"text": "Отправить 2", "callback_data": f"s:{sid}:1"},
+                {"text": "✍ Правка 2",  "callback_data": f"e:{sid}:1"},
+            ],
+            [
+                {"text": "Отправить 3", "callback_data": f"s:{sid}:2"},
+                {"text": "✍ Правка 3",  "callback_data": f"e:{sid}:2"},
+            ],
+        ]
+    }
+
+    target_chat = SUGGESTIONS_CHAT_ID or chat_id
+    await send_message(target_chat, preview, reply_markup=keyboard, parse_mode="HTML")
+
+async def queue_user_piece(chat_id: int, user: Dict[str, Any], message_id: int, piece_text: str):
+    key = _agg_key(chat_id, user.get("id"))
+    st = AGG.get(key)
+    if not st:
+        st = {"texts": [], "first_id": message_id, "sender": user, "chat_id": chat_id, "timer": None}
+        AGG[key] = st
+    st["texts"].append(piece_text)
+    # перезапуск таймера
+    if st.get("timer"):
+        st["timer"].cancel()
+    st["timer"] = asyncio.create_task(_agg_fire(key))
 
 # -----------------------------
 # FastAPI
@@ -280,6 +324,14 @@ async def set_webhook_url(admin: str, url: str):
         r.raise_for_status()
         return r.json()
 
+# нормализация команд: /cmd и /cmd@username
+def _norm_cmd(t: str) -> str:
+    if not t or not t.startswith("/"):
+        return ""
+    first = t.strip().split()[0]
+    base = first.split("@")[0].lower()
+    return base
+
 @app.post("/webhook/{secret}")
 async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
@@ -296,7 +348,6 @@ async def webhook(secret: str, request: Request):
         sid = None
         idx = 0
         if data_raw.startswith("s:"):
-            # формат: s:<uuid>:<i>
             try:
                 _, sid, idx_str = data_raw.split(":")
                 idx = int(idx_str)
@@ -304,9 +355,9 @@ async def webhook(secret: str, request: Request):
             except Exception:
                 action = None
         elif data_raw.startswith("e:"):
-            # формат: e:<uuid>
             try:
-                _, sid = data_raw.split(":")
+                _, sid, idx_str = data_raw.split(":")
+                idx = int(idx_str)
                 action = "edit"
             except Exception:
                 action = None
@@ -314,7 +365,6 @@ async def webhook(secret: str, request: Request):
         if not action or not sid:
             return {"ok": True}
 
-        # запомним сообщение с кнопками (чтобы удалить позже)
         curator_chat_id = cbq["message"]["chat"]["id"]
         curator_msg_id  = cbq["message"]["message_id"]
 
@@ -337,6 +387,7 @@ async def webhook(secret: str, request: Request):
             return {"ok": True}
 
         if action == "edit":
+            text_to_edit = expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0])
             curator_id = cbq.get("from", {}).get("id")
             wait_key = f"wait:{curator_chat_id}:{curator_id}"
             payload = {"chat_id": chat_id, "reply_to": reply_to}
@@ -346,7 +397,11 @@ async def webhook(secret: str, request: Request):
                 wait_key, Json(payload)
             )
             await safe_delete_message(curator_chat_id, curator_msg_id)
-            await send_message(curator_chat_id, "Пришлите одним сообщением текст правки — я отправлю его в рабочий чат реплаем к исходному.")
+            await send_message(
+                curator_chat_id,
+                text_to_edit,
+                reply_markup={"force_reply": True, "input_field_placeholder": "Отредактируйте и отправьте — я перешлю в рабочий чат"}
+            )
             return {"ok": True}
 
         return {"ok": True}
@@ -356,13 +411,14 @@ async def webhook(secret: str, request: Request):
     if not msg:
         return {"ok": True}
 
-    text = msg.get("text") or msg.get("caption") or ""
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
     from_user = msg.get("from", {})
     is_bot = from_user.get("is_bot", False)
+    message_id = msg.get("message_id")
 
-    # команды (понимаем /cmd и /cmd@username)
+    # команды
+    text = msg.get("text") or msg.get("caption") or ""
     cmd = _norm_cmd(text)
     if cmd == "/id":
         await send_message(chat_id, f"chat_id: {chat_id}")
@@ -371,7 +427,7 @@ async def webhook(secret: str, request: Request):
         await send_message(chat_id, "pong")
         return {"ok": True}
     if cmd == "/help":
-        await send_message(chat_id, "Команды: /id, /ping, /help. В рабочем чате студента бот отправит подсказки в чат кураторов.")
+        await send_message(chat_id, "Команды: /id, /ping, /help. В рабочем чате карточки генерятся автоматически.")
         return {"ok": True}
 
     # приём правки из чата кураторов
@@ -380,48 +436,24 @@ async def webhook(secret: str, request: Request):
         wait_key = f"wait:{SUGGESTIONS_CHAT_ID}:{curator_id}"
         row = await db_fetchrow("SELECT payload FROM edit_waits WHERE key=%s", wait_key)
         if row:
-            payload = row[0]  # psycopg отдаст dict для JSONB
+            payload = row[0]
             await db_execute("DELETE FROM edit_waits WHERE key=%s", wait_key)
             await send_message(payload["chat_id"], text, reply_to=payload["reply_to"])
             return {"ok": True}
 
-    # генерируем подсказки для MAIN_CHAT (но не на команды)
-    if MAIN_CHAT_ID and chat_id == MAIN_CHAT_ID and not is_bot and text and not cmd:
-        orig_message_id = msg.get("message_id")
-        sender = from_user.get("first_name") or from_user.get("username") or "Студент"
+    # --- рабочий чат: собираем контент (текст + медиа) и шлём карточку с задержкой
+    if MAIN_CHAT_ID and chat_id == MAIN_CHAT_ID and not is_bot:
+        # медиа — копируем в кураторский чат и добавляем маркер
+        label = media_marker(msg)
+        if label and SUGGESTIONS_CHAT_ID:
+            await copy_message(SUGGESTIONS_CHAT_ID, chat_id, message_id)
+            await queue_user_piece(chat_id, from_user, message_id, label)
+            return {"ok": True}
 
-        suggestions = await llm_suggestions(text)
-        sid = uuid.uuid4()
-        await db_execute(
-            "INSERT INTO suggestion_sessions(id, chat_id, reply_to, s1, s2, s3) VALUES(%s,%s,%s,%s,%s,%s)",
-            str(sid), chat_id, orig_message_id, suggestions[0], suggestions[1], suggestions[2]
-        )
-
-        sugs_display = [expand_links(s) for s in suggestions]
-
-        # короткий callback_data (<64 байт) — без JSON
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "Отправить 1", "callback_data": f"s:{sid}:0"},
-                    {"text": "Отправить 2", "callback_data": f"s:{sid}:1"},
-                    {"text": "Отправить 3", "callback_data": f"s:{sid}:2"},
-                ],
-                [
-                    {"text": "Отправить с правкой", "callback_data": f"e:{sid}"},
-                ]
-            ]
-        }
-
-        preview = (
-            f"Новое сообщение в рабочем чате от {sender}:\n\n"
-            f"{text[:400]}" + ("…" if len(text) > 400 else "") +
-            "\n\nВарианты:\n1) " + sugs_display[0] + "\n\n2) " + sugs_display[1] + "\n\n3) " + sugs_display[2]
-        )
-
-        target_chat = SUGGESTIONS_CHAT_ID or chat_id
-        await send_message(target_chat, preview, reply_markup=keyboard)
-        return {"ok": True}
+        # обычный текст (или подпись к медиа)
+        if text and not cmd:
+            await queue_user_piece(chat_id, from_user, message_id, text)
+            return {"ok": True}
 
     return {"ok": True}
 
@@ -429,7 +461,8 @@ async def webhook(secret: str, request: Request):
 async def _gc_loop():
     while True:
         try:
-            await gc_db()
+            await db_execute("DELETE FROM suggestion_sessions WHERE created_at < now() - interval '24 hours'")
+            await db_execute("DELETE FROM edit_waits WHERE created_at < now() - interval '2 hours'")
         except Exception as e:
             print("[GC ERROR]", e)
         await asyncio.sleep(300)
