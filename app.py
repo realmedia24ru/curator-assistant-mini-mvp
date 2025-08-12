@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 
-# psycopg (бинарные колёса, без компиляции)
+# psycopg (бинарные колёса)
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
@@ -18,9 +18,9 @@ from psycopg.types.json import Json
 # ENV
 # -----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_SECRET      = os.getenv("WEBHOOK_SECRET", "")          # секрет в URL вебхука
-ADMIN_TOKEN         = os.getenv("ADMIN_TOKEN", "")             # для /set_webhook и /initdb
-DATABASE_URL        = os.getenv("DATABASE_URL", "")            # Render PostgreSQL
+WEBHOOK_SECRET      = os.getenv("WEBHOOK_SECRET", "")
+ADMIN_TOKEN         = os.getenv("ADMIN_TOKEN", "")
+DATABASE_URL        = os.getenv("DATABASE_URL", "")
 MAIN_CHAT_ID        = int(os.getenv("MAIN_CHAT_ID", "0") or 0)
 SUGGESTIONS_CHAT_ID = int(os.getenv("SUGGESTIONS_CHAT_ID", "0") or 0)
 OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
@@ -56,7 +56,6 @@ DDL_STATEMENTS = [
 ]
 
 async def init_db():
-    """Создаёт пул и таблицы. Автокоммит включён, чтобы не возиться с транзакциями для MVP."""
     global POOL
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty")
@@ -92,7 +91,6 @@ async def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(url, json=payload)
         if r.status_code >= 400:
-            # логируем тело ответа Telegram — сразу видно «почему 400»
             try:
                 print("[TG ERROR]", r.status_code, r.text)
             except Exception:
@@ -161,7 +159,7 @@ async def llm_suggestions(user_text: str) -> List[str]:
             out = []
             for s in suggestions[:3]:
                 s = str(s).replace("\n\n", "\n").strip()
-                out.append(s[:600])  # укорочено, чтобы гарантированно <4096 вместе с прелюдом
+                out.append(s[:600])  # короче, чтобы точно <4096 вместе с превью
             while len(out) < 3:
                 out.append("Уточните, пожалуйста, детали — помогу пошагово.")
             return out[:3]
@@ -221,12 +219,12 @@ async def set_webhook_url(admin: str, url: str):
         r.raise_for_status()
         return r.json()
 
-# ---- нормализация команд в группах: /cmd или /cmd@username ----
+# ---- нормализация команд: /cmd и /cmd@username ----
 def _norm_cmd(t: str) -> str:
     if not t or not t.startswith("/"):
         return ""
-    first = t.strip().split()[0]        # первый токен
-    base = first.split("@")[0].lower()  # отрезаем @username, если есть
+    first = t.strip().split()[0]
+    base = first.split("@")[0].lower()
     return base
 
 @app.post("/webhook/{secret}")
@@ -235,17 +233,33 @@ async def webhook(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="forbidden")
     update = await request.json()
 
-    # callback_query
+    # callback_query (кнопки)
     if "callback_query" in update:
         cbq = update["callback_query"]
         await answer_callback_query(cbq.get("id"), "Ок")
-        try:
-            data = json.loads(cbq.get("data"))
-        except Exception:
-            data = {}
-        action = data.get("a")
-        sid    = data.get("sid")
-        idx    = int(data.get("i", 0))
+        data_raw = cbq.get("data") or ""
+
+        action = None
+        sid = None
+        idx = 0
+        if data_raw.startswith("s:"):
+            # формат: s:<uuid>:<i>
+            try:
+                _, sid, idx_str = data_raw.split(":")
+                idx = int(idx_str)
+                action = "send"
+            except Exception:
+                action = None
+        elif data_raw.startswith("e:"):
+            # формат: e:<uuid>
+            try:
+                _, sid = data_raw.split(":")
+                action = "edit"
+            except Exception:
+                action = None
+
+        if not action or not sid:
+            return {"ok": True}
 
         row = await db_fetchrow(
             "SELECT chat_id, reply_to, s1, s2, s3 FROM suggestion_sessions WHERE id=%s",
@@ -289,7 +303,7 @@ async def webhook(secret: str, request: Request):
     from_user = msg.get("from", {})
     is_bot = from_user.get("is_bot", False)
 
-    # команды (понимаем /cmd и /cmd@username)
+    # команды
     cmd = _norm_cmd(text)
     if cmd == "/id":
         await send_message(chat_id, f"chat_id: {chat_id}")
@@ -307,7 +321,7 @@ async def webhook(secret: str, request: Request):
         wait_key = f"wait:{SUGGESTIONS_CHAT_ID}:{curator_id}"
         row = await db_fetchrow("SELECT payload FROM edit_waits WHERE key=%s", wait_key)
         if row:
-            payload = row[0]  # psycopg вернёт dict для JSONB
+            payload = row[0]
             await db_execute("DELETE FROM edit_waits WHERE key=%s", wait_key)
             await send_message(payload["chat_id"], text, reply_to=payload["reply_to"])
             return {"ok": True}
@@ -324,18 +338,20 @@ async def webhook(secret: str, request: Request):
             str(sid), chat_id, orig_message_id, suggestions[0], suggestions[1], suggestions[2]
         )
 
+        # ВАЖНО: короткий callback_data (<64 байт) — без JSON
         keyboard = {
             "inline_keyboard": [
                 [
-                    {"text": "Отправить 1", "callback_data": json.dumps({"a":"send","sid": str(sid), "i":0})},
-                    {"text": "Отправить 2", "callback_data": json.dumps({"a":"send","sid": str(sid), "i":1})},
-                    {"text": "Отправить 3", "callback_data": json.dumps({"a":"send","sid": str(sid), "i":2})},
+                    {"text": "Отправить 1", "callback_data": f"s:{sid}:0"},
+                    {"text": "Отправить 2", "callback_data": f"s:{sid}:1"},
+                    {"text": "Отправить 3", "callback_data": f"s:{sid}:2"},
                 ],
                 [
-                    {"text": "Отправить с правкой", "callback_data": json.dumps({"a":"edit","sid": str(sid)})},
+                    {"text": "Отправить с правкой", "callback_data": f"e:{sid}"},
                 ]
             ]
         }
+
         preview = (
             f"Новое сообщение в рабочем чате от {sender}:\n\n"
             f"{text[:400]}" + ("…" if len(text) > 400 else "") +
