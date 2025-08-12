@@ -101,9 +101,9 @@ async def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 async def send_message(
     chat_id: int,
     text: str,
-    reply_to: int | None = None,
-    parse_mode: str | None = None,
-    reply_markup: Dict[str, Any] | None = None
+    reply_to: Optional[int] = None,
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[Dict[str, Any]] = None
 ):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to:
@@ -130,6 +130,18 @@ SYSTEM_PROMPT = (
 COURSE_HINTS = (
     "Правила чата: <правила>; Анкета: <анкета>; Вводная лекция: <вводная>; Платформа: onstudy.org; База защит: <база_защит>."
 )
+
+# автозамена плейсхолдеров на реальные ссылки
+LINKS = {
+    "<правила>": "https://t.me/c/2471800961/20",
+    "<анкета>": "https://forms.gle/mUYXTjswVtxWVpvJA",
+    "<вводная>": "https://t.me/c/2471800961/1737",
+    "<база_защит>": "https://onstudy.org/courses/baza-zaschit-hudozhnikov-2-0/",
+}
+def expand_links(txt: str) -> str:
+    for k, v in LINKS.items():
+        txt = txt.replace(k, v)
+    return txt
 
 async def llm_suggestions(user_text: str) -> List[str]:
     if not OPENAI_API_KEY:
@@ -159,7 +171,7 @@ async def llm_suggestions(user_text: str) -> List[str]:
             out = []
             for s in suggestions[:3]:
                 s = str(s).replace("\n\n", "\n").strip()
-                out.append(s[:600])  # короче, чтобы точно <4096 вместе с превью
+                out.append(s[:600])  # держим коротко, чтобы всё сообщение <4096
             while len(out) < 3:
                 out.append("Уточните, пожалуйста, детали — помогу пошагово.")
             return out[:3]
@@ -177,6 +189,14 @@ async def llm_suggestions(user_text: str) -> List[str]:
 async def gc_db():
     await db_execute("DELETE FROM suggestion_sessions WHERE created_at < now() - interval '24 hours'")
     await db_execute("DELETE FROM edit_waits WHERE created_at < now() - interval '2 hours'")
+
+# нормализация команд: /cmd и /cmd@username
+def _norm_cmd(t: str) -> str:
+    if not t or not t.startswith("/"):
+        return ""
+    first = t.strip().split()[0]
+    base = first.split("@")[0].lower()
+    return base
 
 # -----------------------------
 # FastAPI
@@ -219,21 +239,13 @@ async def set_webhook_url(admin: str, url: str):
         r.raise_for_status()
         return r.json()
 
-# ---- нормализация команд: /cmd и /cmd@username ----
-def _norm_cmd(t: str) -> str:
-    if not t or not t.startswith("/"):
-        return ""
-    first = t.strip().split()[0]
-    base = first.split("@")[0].lower()
-    return base
-
 @app.post("/webhook/{secret}")
 async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
     update = await request.json()
 
-    # callback_query (кнопки)
+    # ----- callback_query (кнопки)
     if "callback_query" in update:
         cbq = update["callback_query"]
         await answer_callback_query(cbq.get("id"), "Ок")
@@ -273,8 +285,8 @@ async def webhook(secret: str, request: Request):
         suggestions = [s1, s2, s3]
 
         if action == "send":
-            text = suggestions[idx] if 0 <= idx < 3 else suggestions[0]
-            await send_message(chat_id, text, reply_to=reply_to)
+            text_to_send = expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0])
+            await send_message(chat_id, text_to_send, reply_to=reply_to)
             return {"ok": True}
 
         if action == "edit":
@@ -292,7 +304,7 @@ async def webhook(secret: str, request: Request):
 
         return {"ok": True}
 
-    # обычные сообщения
+    # ----- обычные сообщения
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return {"ok": True}
@@ -303,7 +315,7 @@ async def webhook(secret: str, request: Request):
     from_user = msg.get("from", {})
     is_bot = from_user.get("is_bot", False)
 
-    # команды
+    # команды (понимаем /cmd и /cmd@username)
     cmd = _norm_cmd(text)
     if cmd == "/id":
         await send_message(chat_id, f"chat_id: {chat_id}")
@@ -321,13 +333,13 @@ async def webhook(secret: str, request: Request):
         wait_key = f"wait:{SUGGESTIONS_CHAT_ID}:{curator_id}"
         row = await db_fetchrow("SELECT payload FROM edit_waits WHERE key=%s", wait_key)
         if row:
-            payload = row[0]
+            payload = row[0]  # psycopg отдаст dict для JSONB
             await db_execute("DELETE FROM edit_waits WHERE key=%s", wait_key)
             await send_message(payload["chat_id"], text, reply_to=payload["reply_to"])
             return {"ok": True}
 
-    # генерируем подсказки для MAIN_CHAT
-    if MAIN_CHAT_ID and chat_id == MAIN_CHAT_ID and not is_bot and text:
+    # генерируем подсказки для MAIN_CHAT (но не на команды)
+    if MAIN_CHAT_ID and chat_id == MAIN_CHAT_ID and not is_bot and text and not cmd:
         orig_message_id = msg.get("message_id")
         sender = from_user.get("first_name") or from_user.get("username") or "Студент"
 
@@ -338,7 +350,9 @@ async def webhook(secret: str, request: Request):
             str(sid), chat_id, orig_message_id, suggestions[0], suggestions[1], suggestions[2]
         )
 
-        # ВАЖНО: короткий callback_data (<64 байт) — без JSON
+        sugs_display = [expand_links(s) for s in suggestions]
+
+        # короткий callback_data (<64 байт) — без JSON
         keyboard = {
             "inline_keyboard": [
                 [
@@ -355,7 +369,7 @@ async def webhook(secret: str, request: Request):
         preview = (
             f"Новое сообщение в рабочем чате от {sender}:\n\n"
             f"{text[:400]}" + ("…" if len(text) > 400 else "") +
-            "\n\nВарианты:\n1) " + suggestions[0] + "\n\n2) " + suggestions[1] + "\n\n3) " + suggestions[2]
+            "\n\nВарианты:\n1) " + sugs_display[0] + "\n\n2) " + sugs_display[1] + "\n\n3) " + sugs_display[2]
         )
 
         target_chat = SUGGESTIONS_CHAT_ID or chat_id
