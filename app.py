@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import uuid
+import re
 from typing import Dict, Any, List, Optional
 
 import httpx
@@ -15,7 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
 
 # импорт «знаний»
-from kb import SYSTEM_PROMPT, COURSE_HINTS, LINKS, expand_links, rule_suggestions
+from kb import SYSTEM_PROMPT, COURSE_HINTS, expand_links, rule_suggestions
 
 # -----------------------------
 # ENV
@@ -129,7 +130,7 @@ async def safe_delete_message(chat_id: int, message_id: int):
         print("[TG DELETE ERROR]", e)
 
 # -----------------------------
-# LLM suggestions (3 варианта)
+# LLM suggestions (3 варианта) с устойчивым парсером
 # -----------------------------
 async def llm_suggestions(user_text: str) -> List[str]:
     # если ключа нет — сразу умный фолбэк
@@ -142,26 +143,84 @@ async def llm_suggestions(user_text: str) -> List[str]:
         "model": MODEL_NAME,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Сообщение студента: {user_text}\nКонтекст курса: {COURSE_HINTS}"}
+            {"role": "user", "content":
+                f"Сообщение студента: {user_text}\n"
+                f"Контекст курса: {COURSE_HINTS}\n"
+                f"Ответь строго JSON-списком из трёх строк без комментариев и преамбул."}
         ],
         "temperature": 0.4,
         "max_tokens": 400
     }
+
+    def _parse_suggestions(raw: str) -> List[str]:
+        if not raw:
+            return []
+
+        raw = raw.strip()
+
+        # 1) Вытянуть из код-фенса ```json ... ```
+        m = re.search(r"```(?:json)?\s*(.*?)```", raw, flags=re.S | re.I)
+        if m:
+            raw = m.group(1).strip()
+
+        # 2) Если это уже JSON — пробуем распарсить
+        if raw and raw[0] in "[{":
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict) and "s" in obj and isinstance(obj["s"], list):
+                    return [str(x).strip() for x in obj["s"]][:3]
+                if isinstance(obj, list):
+                    return [str(x).strip() for x in obj][:3]
+            except Exception:
+                pass
+
+        # 3) Попытка вырезать первый массив [...] из текста
+        i, j = raw.find("["), raw.rfind("]")
+        if i != -1 and j != -1 and j > i:
+            snippet = raw[i:j+1]
+            try:
+                arr = json.loads(snippet)
+                if isinstance(arr, list):
+                    return [str(x).strip() for x in arr][:3]
+            except Exception:
+                pass
+
+        # 4) Фолбэк: берём первые 3 «строки/буллета»
+        lines = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^(\d+[\).\:-]|\-|\*|\•)\s*", "", line)
+            lines.append(line)
+            if len(lines) >= 3:
+                break
+        return lines[:3]
+
     async with httpx.AsyncClient(timeout=40.0) as client:
         try:
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
             data = r.json()
-            raw = data["choices"][0]["message"]["content"].strip()
-            suggestions = json.loads(raw)
-            out = []
+            raw = (data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")).strip()
+            suggestions = _parse_suggestions(raw)
+
+            # нормализуем до 3 вариантов
+            out: List[str] = []
             for s in suggestions[:3]:
                 s = str(s).replace("\n\n", "\n").strip()
                 out.append(s[:600])  # держим коротко, чтобы всё сообщение <4096
             while len(out) < 3:
                 out.append("Уточните, пожалуйста, детали — помогу пошагово.")
             return out[:3]
+
         except Exception as e:
+            try:
+                print("[LLM RAW FAIL]", raw[:200] if 'raw' in locals() else "<no content>")
+            except Exception:
+                pass
             print("[LLM ERROR]", e)
             return rule_suggestions(user_text)
 
