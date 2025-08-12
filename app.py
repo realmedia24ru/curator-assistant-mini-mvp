@@ -14,6 +14,9 @@ import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
 
+# импорт «знаний»
+from kb import SYSTEM_PROMPT, COURSE_HINTS, LINKS, expand_links, rule_suggestions
+
 # -----------------------------
 # ENV
 # -----------------------------
@@ -56,6 +59,7 @@ DDL_STATEMENTS = [
 ]
 
 async def init_db():
+    """Создаём пул и таблицы. Без deprecated open=True — открываем пул отдельно."""
     global POOL
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty")
@@ -64,9 +68,9 @@ async def init_db():
             DATABASE_URL,
             min_size=1,
             max_size=5,
-            open=True,
             kwargs={"autocommit": True},
         )
+        await POOL.open()
         async with POOL.connection() as conn:
             async with conn.cursor() as cur:
                 for stmt in DDL_STATEMENTS:
@@ -118,38 +122,20 @@ async def send_message(
 async def answer_callback_query(callback_query_id: str, text: str = ""):
     return await tg_call("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
+async def safe_delete_message(chat_id: int, message_id: int):
+    try:
+        await tg_call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    except Exception as e:
+        print("[TG DELETE ERROR]", e)
+
 # -----------------------------
 # LLM suggestions (3 варианта)
 # -----------------------------
-SYSTEM_PROMPT = (
-    "Ты — куратор онлайн-программы по современному искусству. Отвечай кратко, дружелюбно, конкретно. "
-    "Если вопрос организационный — предлагай короткие шаги. Не обещай возвраты/сроки. "
-    "Сгенерируй РОВНО 3 варианта: 1) Коротко по делу; 2) Эмпатия + шаги; 3) Ссылочный (плейсхолдеры <правила>, <анкета>, <вводная>, <база_защит>). "
-    'Выведи JSON-список строк: ["...","...","..."].'
-)
-COURSE_HINTS = (
-    "Правила чата: <правила>; Анкета: <анкета>; Вводная лекция: <вводная>; Платформа: onstudy.org; База защит: <база_защит>."
-)
-
-# автозамена плейсхолдеров на реальные ссылки
-LINKS = {
-    "<правила>": "https://t.me/c/2471800961/20",
-    "<анкета>": "https://forms.gle/mUYXTjswVtxWVpvJA",
-    "<вводная>": "https://t.me/c/2471800961/1737",
-    "<база_защит>": "https://onstudy.org/courses/baza-zaschit-hudozhnikov-2-0/",
-}
-def expand_links(txt: str) -> str:
-    for k, v in LINKS.items():
-        txt = txt.replace(k, v)
-    return txt
-
 async def llm_suggestions(user_text: str) -> List[str]:
+    # если ключа нет — сразу умный фолбэк
     if not OPENAI_API_KEY:
-        return [
-            "Подскажите, к какому модулю относится вопрос? Помогу быстро сориентироваться.",
-            "Понимаю, на старте информации много — давайте по шагам: 1) посмотрите вводную, 2) заполните анкету, 3) напишите #ТочкаА. Если нужно — пришлю ссылки.",
-            "Собрала полезное: <правила>, <анкета>, <вводная>, <база_защит>. Напишите, какие ссылки прислать первым делом."
-        ]
+        return rule_suggestions(user_text)
+
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -177,11 +163,7 @@ async def llm_suggestions(user_text: str) -> List[str]:
             return out[:3]
         except Exception as e:
             print("[LLM ERROR]", e)
-            return [
-                "Могу подсказать. Скажите, про какой модуль/материал речь?",
-                "Предлагаю шаги: 1) вводная лекция, 2) анкета, 3) #ТочкаА. По желанию дам ссылки.",
-                "Полезные ссылки: <правила>, <анкета>, <вводная>, <база_защит>."
-            ]
+            return rule_suggestions(user_text)
 
 # -----------------------------
 # Utils
@@ -273,12 +255,17 @@ async def webhook(secret: str, request: Request):
         if not action or not sid:
             return {"ok": True}
 
+        # запомним сообщение с кнопками (чтобы удалить позже)
+        curator_chat_id = cbq["message"]["chat"]["id"]
+        curator_msg_id  = cbq["message"]["message_id"]
+
         row = await db_fetchrow(
             "SELECT chat_id, reply_to, s1, s2, s3 FROM suggestion_sessions WHERE id=%s",
             sid
         )
         if not row:
-            await send_message(cbq["message"]["chat"]["id"], "Сессия устарела. Сгенерируйте подсказки заново.")
+            await safe_delete_message(curator_chat_id, curator_msg_id)
+            await send_message(curator_chat_id, "Сессия устарела. Сгенерируйте подсказки заново.")
             return {"ok": True}
 
         chat_id, reply_to, s1, s2, s3 = row
@@ -287,10 +274,10 @@ async def webhook(secret: str, request: Request):
         if action == "send":
             text_to_send = expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0])
             await send_message(chat_id, text_to_send, reply_to=reply_to)
+            await safe_delete_message(curator_chat_id, curator_msg_id)
             return {"ok": True}
 
         if action == "edit":
-            curator_chat_id = cbq["message"]["chat"]["id"]
             curator_id = cbq.get("from", {}).get("id")
             wait_key = f"wait:{curator_chat_id}:{curator_id}"
             payload = {"chat_id": chat_id, "reply_to": reply_to}
@@ -299,6 +286,7 @@ async def webhook(secret: str, request: Request):
                 "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, created_at=now()",
                 wait_key, Json(payload)
             )
+            await safe_delete_message(curator_chat_id, curator_msg_id)
             await send_message(curator_chat_id, "Пришлите одним сообщением текст правки — я отправлю его в рабочий чат реплаем к исходному.")
             return {"ok": True}
 
