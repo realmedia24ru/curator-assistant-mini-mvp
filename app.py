@@ -175,13 +175,11 @@ EMOJI_RULES = [
     (["ссылк"], "🔗"),
 ]
 EMOJI_DEFAULT = "💬"
-
 EMOJI_START_RX = re.compile(r"^\s*[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 
 def add_emoji(text: str) -> str:
     if not text:
         return text
-    # не добавляем, если уже начинается с эмодзи
     if EMOJI_START_RX.search(text):
         return text
     t = text.lower()
@@ -232,7 +230,6 @@ async def compose_suggestions(user_text: str) -> List[str]:
     base = rule_suggestions(user_text)
     llm3 = await llm_one_variant(user_text)
     out = [base[0], base[1], llm3]
-    # нормализуем
     out = [s.replace("\n\n","\n").strip()[:600] for s in out]
     return out
 
@@ -256,7 +253,6 @@ async def _agg_fire(key: str):
     if not text_joined:
         text_joined = "[сообщение без текста]"
 
-    # Подсказки (2 из базы + 1 из LLM)
     suggestions = await compose_suggestions(text_joined)
 
     sid = uuid.uuid4()
@@ -265,7 +261,6 @@ async def _agg_fire(key: str):
         str(sid), chat_id, state["first_id"], suggestions[0], suggestions[1], suggestions[2]
     )
 
-    # ссылки + эмодзи
     sugs_display = [add_emoji(expand_links(s)) for s in suggestions]
 
     # кликабельное имя
@@ -282,7 +277,7 @@ async def _agg_fire(key: str):
         f"3) {html_escape(sugs_display[2])}"
     )
 
-    # Кнопки: на каждый вариант «Отправить» и «✍ Правка»
+    # Кнопки: «Отправить/Правка» для 1–3 + «Пропустить»
     keyboard = {
         "inline_keyboard": [
             [
@@ -296,6 +291,9 @@ async def _agg_fire(key: str):
             [
                 {"text": "Отправить 3", "callback_data": f"s:{sid}:2"},
                 {"text": "✍ Правка 3",  "callback_data": f"e:{sid}:2"},
+            ],
+            [
+                {"text": "🗑 Пропустить", "callback_data": f"x:{sid}"},
             ],
         ]
     }
@@ -392,6 +390,12 @@ async def webhook(secret: str, request: Request):
                 action = "edit"
             except Exception:
                 action = None
+        elif data_raw.startswith("x:"):
+            try:
+                _, sid = data_raw.split(":")
+                action = "skip"
+            except Exception:
+                action = None
 
         if not action or not sid:
             return {"ok": True}
@@ -399,6 +403,16 @@ async def webhook(secret: str, request: Request):
         curator_chat_id = cbq["message"]["chat"]["id"]
         curator_msg_id  = cbq["message"]["message_id"]
 
+        # для skip можно не лезть в БД, но подчистим сессию
+        if action == "skip":
+            try:
+                await db_execute("DELETE FROM suggestion_sessions WHERE id=%s", sid)
+            except Exception:
+                pass
+            await safe_delete_message(curator_chat_id, curator_msg_id)
+            return {"ok": True}
+
+        # для send/edit нужна сессия
         row = await db_fetchrow(
             "SELECT chat_id, reply_to, s1, s2, s3 FROM suggestion_sessions WHERE id=%s",
             sid
@@ -414,6 +428,7 @@ async def webhook(secret: str, request: Request):
         if action == "send":
             text_to_send = add_emoji(expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0]))
             await send_message(chat_id, text_to_send, reply_to=reply_to)
+            await db_execute("DELETE FROM suggestion_sessions WHERE id=%s", sid)
             await safe_delete_message(curator_chat_id, curator_msg_id)
             return {"ok": True}
 
