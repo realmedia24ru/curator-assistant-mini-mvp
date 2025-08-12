@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 
-# psycopg (бинарные колёса, не компилируется)
+# psycopg (бинарные колёса, без компиляции)
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
@@ -91,7 +91,13 @@ async def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TELEGRAM_API}/{method}"
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(url, json=payload)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # логируем тело ответа Telegram — сразу видно «почему 400»
+            try:
+                print("[TG ERROR]", r.status_code, r.text)
+            except Exception:
+                pass
+            r.raise_for_status()
         return r.json()
 
 async def send_message(
@@ -121,7 +127,7 @@ SYSTEM_PROMPT = (
     "Ты — куратор онлайн-программы по современному искусству. Отвечай кратко, дружелюбно, конкретно. "
     "Если вопрос организационный — предлагай короткие шаги. Не обещай возвраты/сроки. "
     "Сгенерируй РОВНО 3 варианта: 1) Коротко по делу; 2) Эмпатия + шаги; 3) Ссылочный (плейсхолдеры <правила>, <анкета>, <вводная>, <база_защит>). "
-    "Выведи JSON-список строк: [\"...\",\"...\",\"...\"]."
+    'Выведи JSON-список строк: ["...","...","..."].'
 )
 COURSE_HINTS = (
     "Правила чата: <правила>; Анкета: <анкета>; Вводная лекция: <вводная>; Платформа: onstudy.org; База защит: <база_защит>."
@@ -155,7 +161,7 @@ async def llm_suggestions(user_text: str) -> List[str]:
             out = []
             for s in suggestions[:3]:
                 s = str(s).replace("\n\n", "\n").strip()
-                out.append(s[:900])
+                out.append(s[:600])  # укорочено, чтобы гарантированно <4096 вместе с прелюдом
             while len(out) < 3:
                 out.append("Уточните, пожалуйста, детали — помогу пошагово.")
             return out[:3]
@@ -214,6 +220,14 @@ async def set_webhook_url(admin: str, url: str):
         )
         r.raise_for_status()
         return r.json()
+
+# ---- нормализация команд в группах: /cmd или /cmd@username ----
+def _norm_cmd(t: str) -> str:
+    if not t or not t.startswith("/"):
+        return ""
+    first = t.strip().split()[0]        # первый токен
+    base = first.split("@")[0].lower()  # отрезаем @username, если есть
+    return base
 
 @app.post("/webhook/{secret}")
 async def webhook(secret: str, request: Request):
@@ -275,14 +289,15 @@ async def webhook(secret: str, request: Request):
     from_user = msg.get("from", {})
     is_bot = from_user.get("is_bot", False)
 
-    # команды
-    if text.startswith("/id"):
+    # команды (понимаем /cmd и /cmd@username)
+    cmd = _norm_cmd(text)
+    if cmd == "/id":
         await send_message(chat_id, f"chat_id: {chat_id}")
         return {"ok": True}
-    if text.startswith("/ping"):
+    if cmd == "/ping":
         await send_message(chat_id, "pong")
         return {"ok": True}
-    if text.startswith("/help"):
+    if cmd == "/help":
         await send_message(chat_id, "Команды: /id, /ping, /help. В рабочем чате студента бот отправит подсказки в чат кураторов.")
         return {"ok": True}
 
@@ -323,7 +338,7 @@ async def webhook(secret: str, request: Request):
         }
         preview = (
             f"Новое сообщение в рабочем чате от {sender}:\n\n"
-            f"{text[:700]}" + ("…" if len(text) > 700 else "") +
+            f"{text[:400]}" + ("…" if len(text) > 400 else "") +
             "\n\nВарианты:\n1) " + suggestions[0] + "\n\n2) " + suggestions[1] + "\n\n3) " + suggestions[2]
         )
 
