@@ -31,7 +31,6 @@ OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME          = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
 AGG_WINDOW          = int(os.getenv("AGG_WINDOW", "8"))  # секунд для склейки сообщений
-
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # -----------------------------
@@ -155,11 +154,41 @@ def media_marker(msg: Dict[str, Any]) -> Optional[str]:
     ]
     for key, label in mapping:
         if key in msg:
-            # если это часть альбома — добавим пометку
             if "media_group_id" in msg:
                 return f"{label} (альбом)"
             return label
     return None
+
+# --- ЭМОДЗИФИКАЦИЯ ---
+EMOJI_RULES = [
+    (["правил"], "📜"),
+    (["анкета", "анкет"], "📝"),
+    (["вводн"], "🎬"),
+    (["база защит", "база_защит", "защит"], "🗂️"),
+    (["шаг", "чек-лист", "по шагам"], "✅"),
+    (["встреч", "график", "расписан", "зум", "zoom"], "📅"),
+    (["вопрос", "спросите", "уточните"], "❓"),
+    (["пакет документ", "портфолио", "пакет"], "📁"),
+    (["записать", "слот", "дедлайн", "срок"], "⏰"),
+    (["onstudy", "платформ"], "💻"),
+    (["поддерж", "мотивац", "успех", "удачи", "пожалуйста", "спасибо"], "💜"),
+    (["ссылк"], "🔗"),
+]
+EMOJI_DEFAULT = "💬"
+
+EMOJI_START_RX = re.compile(r"^\s*[\U0001F300-\U0001FAFF\u2600-\u27BF]")
+
+def add_emoji(text: str) -> str:
+    if not text:
+        return text
+    # не добавляем, если уже начинается с эмодзи
+    if EMOJI_START_RX.search(text):
+        return text
+    t = text.lower()
+    for keys, emoji in EMOJI_RULES:
+        if any(k in t for k in keys):
+            return f"{emoji} {text}"
+    return f"{EMOJI_DEFAULT} {text}"
 
 # -----------------------------
 # LLM: один «творческий» вариант
@@ -203,7 +232,9 @@ async def compose_suggestions(user_text: str) -> List[str]:
     base = rule_suggestions(user_text)
     llm3 = await llm_one_variant(user_text)
     out = [base[0], base[1], llm3]
-    return [s.replace("\n\n","\n").strip()[:600] for s in out]
+    # нормализуем
+    out = [s.replace("\n\n","\n").strip()[:600] for s in out]
+    return out
 
 # -----------------------------
 # Склейка сообщений пользователя (debounce)
@@ -234,7 +265,8 @@ async def _agg_fire(key: str):
         str(sid), chat_id, state["first_id"], suggestions[0], suggestions[1], suggestions[2]
     )
 
-    sugs_display = [expand_links(s) for s in suggestions]
+    # ссылки + эмодзи
+    sugs_display = [add_emoji(expand_links(s)) for s in suggestions]
 
     # кликабельное имя
     sender_id = user.get("id")
@@ -278,7 +310,6 @@ async def queue_user_piece(chat_id: int, user: Dict[str, Any], message_id: int, 
         st = {"texts": [], "first_id": message_id, "sender": user, "chat_id": chat_id, "timer": None}
         AGG[key] = st
     st["texts"].append(piece_text)
-    # перезапуск таймера
     if st.get("timer"):
         st["timer"].cancel()
     st["timer"] = asyncio.create_task(_agg_fire(key))
@@ -381,13 +412,13 @@ async def webhook(secret: str, request: Request):
         suggestions = [s1, s2, s3]
 
         if action == "send":
-            text_to_send = expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0])
+            text_to_send = add_emoji(expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0]))
             await send_message(chat_id, text_to_send, reply_to=reply_to)
             await safe_delete_message(curator_chat_id, curator_msg_id)
             return {"ok": True}
 
         if action == "edit":
-            text_to_edit = expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0])
+            text_to_edit = add_emoji(expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0]))
             curator_id = cbq.get("from", {}).get("id")
             wait_key = f"wait:{curator_chat_id}:{curator_id}"
             payload = {"chat_id": chat_id, "reply_to": reply_to}
@@ -443,14 +474,12 @@ async def webhook(secret: str, request: Request):
 
     # --- рабочий чат: собираем контент (текст + медиа) и шлём карточку с задержкой
     if MAIN_CHAT_ID and chat_id == MAIN_CHAT_ID and not is_bot:
-        # медиа — копируем в кураторский чат и добавляем маркер
         label = media_marker(msg)
         if label and SUGGESTIONS_CHAT_ID:
             await copy_message(SUGGESTIONS_CHAT_ID, chat_id, message_id)
             await queue_user_piece(chat_id, from_user, message_id, label)
             return {"ok": True}
 
-        # обычный текст (или подпись к медиа)
         if text and not cmd:
             await queue_user_piece(chat_id, from_user, message_id, text)
             return {"ok": True}
