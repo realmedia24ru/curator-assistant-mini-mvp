@@ -1,5 +1,22 @@
 import re
+import csv
 from typing import List
+
+# Загрузка ответов из CSV
+def load_answers_from_csv(filename: str):
+    answers = {}
+    with open(filename, mode='r', encoding='utf-8') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            answers[row['keyword'].lower()] = {
+                'answer_1': row['answer_1'],
+                'answer_2': row['answer_2'],
+                'answer_3': row['answer_3']
+            }
+    return answers
+
+# Загрузка базы данных ответов
+answers_data = load_answers_from_csv('answers.csv')
 
 # Системный промпт и подсказки для LLM
 SYSTEM_PROMPT = (
