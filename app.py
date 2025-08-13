@@ -15,8 +15,23 @@ import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
 
-# импорт «знаний»
+# импорт «знаний» (KB)
 from kb import SYSTEM_PROMPT, COURSE_HINTS, expand_links, rule_suggestions
+# опционально: горячая перезагрузка KB, если есть такая функция в kb.py
+try:
+    from kb import reload_kb as kb_reload
+except Exception:
+    async def kb_reload():
+        return {"ok": True, "rows": 0}
+
+# шаблоны (Google Sheets → CSV)
+try:
+    from templates import reload_templates, render_template
+except Exception:
+    async def reload_templates():
+        return {"ok": True, "count": 0}
+    def render_template(slug: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        return {}
 
 # -----------------------------
 # ENV
@@ -70,7 +85,7 @@ async def init_db():
             DATABASE_URL,
             min_size=1,
             max_size=5,
-            open=False,
+            open=False,  # важное отличие — руками открываем ниже
             kwargs={"autocommit": True},
         )
         await POOL.open()
@@ -322,6 +337,15 @@ class UpdateModel(BaseModel):
 @app.on_event("startup")
 async def on_startup():
     await init_db()
+    # на старте подгружаем KB и шаблоны (если доступны)
+    try:
+        await kb_reload()
+    except Exception as e:
+        print("[KB RELOAD ON START ERROR]", e)
+    try:
+        await reload_templates()
+    except Exception as e:
+        print("[TPL RELOAD ON START ERROR]", e)
     asyncio.create_task(_gc_loop())
 
 @app.get("/health")
@@ -334,6 +358,18 @@ async def initdb(admin: str):
         raise HTTPException(status_code=403, detail="forbidden")
     await init_db()
     return {"ok": True}
+
+@app.get("/reload_kb")
+async def http_reload_kb(admin: str):
+    if admin != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return await kb_reload()
+
+@app.get("/reload_templates")
+async def http_reload_templates(admin: str):
+    if admin != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return await reload_templates()
 
 @app.get("/set_webhook")
 async def set_webhook(admin: str):
