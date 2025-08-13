@@ -1,8 +1,6 @@
-# templates.py
 import os, csv, io, json, time, httpx
 from typing import Dict, Any
 
-# Читаем JSON-карту имя→CSV-URL из ENV
 TPL_REMOTE_JSON = os.getenv("TPL_REMOTE_JSON", "")
 
 _TPL: Dict[str, Dict[str, Any]] = {}
@@ -33,24 +31,21 @@ async def reload_templates():
         _LOADED_AT = time.time()
         return {"ok": True, "count": 0, "loaded_at": _LOADED_AT, "src": None}
 
-    # распарсим JSON-строку: {"welcome":"url1","ls":"url2",...}
-    mapping = json.loads(TPL_REMOTE_JSON)
+    mapping = json.loads(TPL_REMOTE_JSON)  # {"welcome":"url", ...}
     async with httpx.AsyncClient(timeout=30) as c:
         for name, url in mapping.items():
-            r = await c.get(url)
+            r = await c.get(url, follow_redirects=True)  # <— ВАЖНО
             r.raise_for_status()
             _load_csv_text(r.text, source=url)
     _LOADED_AT = time.time()
     return {"ok": True, "count": len(_TPL), "loaded_at": _LOADED_AT}
 
 def render_template(slug: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    """Возвращает {'text','parse_mode'} или {} если не найден."""
     tpl = _TPL.get(slug)
     if not tpl:
         return {}
     try:
         text = tpl["text"].format(**context)
     except Exception:
-        # если не хватает переменных — выводим как есть
         text = tpl["text"]
     return {"text": text, "parse_mode": tpl["parse_mode"]}
