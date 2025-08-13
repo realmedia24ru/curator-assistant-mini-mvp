@@ -1,7 +1,6 @@
 import os, re, csv, io, time, httpx
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional
 
-# --------- Константы/подсказки (опционально используются в LLM) ----------
 SYSTEM_PROMPT = (
     "Ты — куратор онлайн-программы по современному искусству. "
     "Отвечай кратко, конкретно, дружелюбно, без общих слов."
@@ -11,7 +10,6 @@ COURSE_HINTS = (
     "Не забывай про #осебе и #ТочкаА, а также про базу защит."
 )
 
-# --------- Базовые ссылки-плейсхолдеры ----------
 LINKS = {
     "<правила>": "https://t.me/c/2471800961/20",
     "<анкета>": "https://forms.gle/mUYXTjswVtxWVpvJA",
@@ -20,11 +18,9 @@ LINKS = {
 }
 
 def expand_links(txt: str) -> str:
-    """Подставляет реальные ссылки вместо плейсхолдеров с поддержкой склонений."""
     if not txt:
         return txt
     out = txt
-    # Нестрогие формы плейсхолдеров (регистронезависимо)
     pats = [
         (r"<\s*правил[а-я]*\s*>", LINKS["<правила>"]),
         (r"<\s*анкет[а-я]*\s*>",  LINKS["<анкета>"]),
@@ -33,16 +29,13 @@ def expand_links(txt: str) -> str:
     ]
     for pat, url in pats:
         out = re.sub(pat, url, out, flags=re.I)
-    # Прямые замены «как есть»
     for k, v in LINKS.items():
         out = out.replace(k, v)
     return out
 
-# --------- Источник правил (CSV) ----------
 KB_CSV_URL  = os.getenv("KB_CSV_URL", "")
-KB_CSV_PATH = os.getenv("KB_CSV_PATH", "kb/kb_rules.csv")  # fallback на локальный файл
+KB_CSV_PATH = os.getenv("KB_CSV_PATH", "kb/kb_rules.csv")
 
-# --------- Простейшая детекция "спасибо/ок" ----------
 _ACK = [
     "спасибо","спасиб","ок","окей","понял","поняла","ага","угу",
     "класс","супер","отлично","ok","thx","thanks"
@@ -51,7 +44,6 @@ def _is_ack(text: str) -> bool:
     t = (text or "").lower()
     return ("?" not in t) and any(w in t for w in _ACK) and len(t) <= 120
 
-# --------- Парсинг и хранение правил ----------
 def _parse_patterns(cell: str):
     if not cell:
         return []
@@ -65,9 +57,8 @@ def _parse_patterns(cell: str):
             out.append(("star", "*"))
             continue
         if p.lower().startswith("re:"):
-            # регэксп после "re:"
             try:
-                rgx = re.compile(p[3:], re.I|re.S)
+                rgx = re.compile(p[3:], re.I | re.S)
                 out.append(("re", rgx))
             except re.error:
                 pass
@@ -106,7 +97,7 @@ async def reload_kb():
     if KB_CSV_URL:
         src = KB_CSV_URL
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(KB_CSV_URL)
+            r = await c.get(KB_CSV_URL, follow_redirects=True)  # <— ВАЖНО
             r.raise_for_status()
             text = r.text
     else:
@@ -119,7 +110,6 @@ async def reload_kb():
     return {"ok": True, "rows": len(_rows), "src": src, "loaded_at": _loaded_at}
 
 def _score(text: str, row: Dict[str, Any]) -> Optional[int]:
-    """Взвешенный скор: совпадение по строкам/регэкспам/звезде + priority."""
     t = (text or "")
     tl = t.lower()
     hit = False
@@ -145,17 +135,11 @@ def _fallback_pair() -> List[str]:
     ]
 
 def rule_suggestions(user_text: str) -> List[str]:
-    """
-    Возвращает 2 коротких варианта ответа из базы правил.
-    Для «спасибо/ок» — специальные короткие ответы.
-    """
-    # быстрые «ack»-ответы
     if _is_ack(user_text):
         return [
             "Пожалуйста! Если появятся вопросы — пишите сюда, поможем.",
             "Рада помочь 💜 Возвращайтесь к лекциям и чату, когда будет удобно."
         ]
-
     if not _rows:
         return _fallback_pair()
 
