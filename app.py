@@ -15,10 +15,12 @@ import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
 
-# импорт «знаний» (KB)
+# импорт «знаний» (KB) + RAG локальные фрагменты
 from kb import SYSTEM_PROMPT, COURSE_HINTS, expand_links, rule_suggestions, get_kb_snippets
 # шаблоны (Google Sheets → CSV)
 from templates import reload_templates, render_template, get_template_snippets
+# Assistants API (новое)
+from assistants import assistants_answer, sync_assistant_from_sheets
 
 # -----------------------------
 # ENV
@@ -33,7 +35,8 @@ OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME          = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
 AGG_WINDOW          = int(os.getenv("AGG_WINDOW", "8"))  # секунд для склейки сообщений
-RAG_MAX_SNIPPETS    = int(os.getenv("RAG_MAX_SNIPPETS", "12"))  # сколько фрагментов отдаём в контекст
+RAG_MAX_SNIPPETS    = int(os.getenv("RAG_MAX_SNIPPETS", "12"))  # для локального RAG
+ASSISTANT_ID        = os.getenv("ASSISTANT_ID", "")  # если задан — используем Assistants API
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # -----------------------------
@@ -62,12 +65,10 @@ DDL_STATEMENTS = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
-    # миграция на случай старой схемы без s4
     "ALTER TABLE suggestion_sessions ADD COLUMN IF NOT EXISTS s4 TEXT NOT NULL DEFAULT ''",
 ]
 
 async def init_db():
-    """Создаём пул и таблицы (без deprecated open=True)."""
     global POOL
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty")
@@ -146,7 +147,7 @@ async def copy_message(to_chat: int, from_chat: int, msg_id: int):
     except Exception as e:
         print("[TG COPY ERROR]", e)
 
-# Определение типа медиа и текстового маркера для агрегатора
+# Определение типа медиа
 def media_marker(msg: Dict[str, Any]) -> Optional[str]:
     mapping = [
         ("photo", "[фото]"),
@@ -165,7 +166,7 @@ def media_marker(msg: Dict[str, Any]) -> Optional[str]:
             return label
     return None
 
-# --- ЭМОДЗИФИКАЦИЯ ---
+# --- ЭМОДЗИ ---
 EMOJI_RULES = [
     (["правил"], "📜"),
     (["анкета", "анкет"], "📝"),
@@ -195,7 +196,7 @@ def add_emoji(text: str) -> str:
     return f"{EMOJI_DEFAULT} {text}"
 
 # -----------------------------
-# LLM: один «творческий» вариант (V3)
+# LLM: «живой» вариант (V3)
 # -----------------------------
 async def llm_one_variant(user_text: str) -> str:
     if not OPENAI_API_KEY:
@@ -223,98 +224,60 @@ async def llm_one_variant(user_text: str) -> str:
             m = re.search(r"```(?:.*?\n)?(.*?)```", raw, flags=re.S)
             if m:
                 raw = m.group(1).strip()
-            text = raw.split("\n\n")[0].strip()
-            if not text:
-                text = raw.strip()
+            text = raw.split("\n\n")[0].strip() or raw.strip()
             return text[:600]
         except Exception as e:
             print("[LLM ONE ERROR]", e)
             return "Если кратко: сформулируйте ближайшую цель и вопрос к ней — поможем точечно на встрече или здесь."
 
 # -----------------------------
-# LLM: RAG-вариант на базе нашей БЗ (V4)
+# V4: Assistants API (если ASSISTANT_ID задан), иначе локальный RAG
 # -----------------------------
 _WORD_RX = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9#@_]+", re.U)
-
 def _rank_snippets(query: str, snippets: List[Dict[str,str]], top_k: int) -> List[Dict[str,str]]:
     q_tokens = set(w.lower() for w in _WORD_RX.findall(query))
     def score(sn):
-        t = sn["text"]
-        toks = _WORD_RX.findall(t.lower())
+        t = sn["text"].lower()
+        toks = _WORD_RX.findall(t)
         overlap = sum(1 for w in toks if w in q_tokens)
-        # лёгкий бонус за наличие ссылок/хэштегов — это часто полезные подсказки
-        bonus = 2 if ("http" in t or "#" in t or "<" in t and ">" in t) else 0
+        bonus = 2 if ("http" in t or "#" in t or ("<" in t and ">" in t)) else 0
         return overlap + bonus
-    ranked = sorted(snippets, key=score, reverse=True)
-    return ranked[:top_k]
+    return sorted(snippets, key=score, reverse=True)[:top_k]
 
 async def llm_rag_variant(user_text: str) -> str:
-    """Строит ответ строго на основе нашей базы (kb_rules + templates)."""
-    if not OPENAI_API_KEY:
-        return "По базе: посмотри <вводная>, анкета: <анкета>, правила: <правила>. Защиты: <база_защит>."
+    # 1) Если настроен ассистент — используем его
+    if ASSISTANT_ID:
+        try:
+            out = await assistants_answer(user_text)
+            if out:
+                return out[:700]
+        except Exception as e:
+            print("[ASSISTANTS ERROR]", e)
+            # fallback ниже
 
-    # собираем фрагменты из kb и всех шаблонов
+    # 2) Локальный RAG (по Sheets, без SDK)
     snippets = get_kb_snippets() + get_template_snippets()
     if not snippets:
         return "По базе пока пусто. Если подскажешь контекст (модуль/вопрос), соберу ссылки из закрепа."
 
     top = _rank_snippets(user_text, snippets, RAG_MAX_SNIPPETS)
+    lines = [sn["text"] for sn in top[:6]]
+    # простой ответ: берём 1–2 самые релевантные строки и склеиваем
+    ans = " ".join(lines[:2]).strip()
+    return ans[:700] if ans else "Проверь закреп и базовые ссылки: <вводная>, <анкета>, <правила>, <база_защит>."
 
-    # формируем компактный контекст
-    context_lines = []
-    for i, sn in enumerate(top, 1):
-        # уже подставим ссылки в kb-фрагментах; в шаблонах оставляем как есть
-        text = expand_links(sn["text"])
-        context_lines.append(f"[{i}] {text}")
-    context_block = "\n".join(context_lines)
-
-    system = (
-        "Ты куратор и отвечаешь ТОЛЬКО на основе предоставленного контекста.\n"
-        "Никаких новых ссылок или фактов не придумывай.\n"
-        "Отвечай кратко (2–4 предложения), по делу, дружелюбно, без вводных «здравствуйте».\n"
-        "Если уместно — используй уже имеющиеся ссылки из контекста. Плейсхолдеры не вставляй."
-    )
-    user = (
-        f"Запрос: {user_text}\n\n"
-        f"Контекст:\n{context_block}\n\n"
-        "Сформируй краткий ответ по делу."
-    )
-
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 220
-    }
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        try:
-            r = await client.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            text = (data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
-            return text[:700] if text else "По базе подсказок: проверьте закреп и базовые ссылки."
-        except Exception as e:
-            print("[LLM RAG ERROR]", e)
-            return "По базе: <вводная>, <анкета>, <правила>, база защит: <база_защит>."
-
-# Композит: 2 из базы + 1 «живой» + 1 RAG
+# Композиция: 2 из базы + 1 «живой» + 1 (Assistants/локальный RAG)
 async def compose_suggestions(user_text: str) -> List[str]:
     base = rule_suggestions(user_text)
     v3 = await llm_one_variant(user_text)
     v4 = await llm_rag_variant(user_text)
     out = [base[0], base[1], v3, v4]
-    out = [s.replace("\n\n","\n").strip()[:700] for s in out]
-    return out
+    return [s.replace("\n\n", "\n").strip()[:700] for s in out]
 
 # -----------------------------
-# Склейка сообщений пользователя (debounce)
+# Агрегатор и FastAPI (как было)
 # -----------------------------
-AGG: Dict[str, Dict[str, Any]] = {}  # key -> {texts:[], first_id:int, sender:dict, timer:Task, chat_id}
+AGG: Dict[str, Dict[str, Any]] = {}
 
 def _agg_key(chat_id: int, user_id: int) -> str:
     return f"{chat_id}:{user_id}"
@@ -324,12 +287,9 @@ async def _agg_fire(key: str):
     state = AGG.pop(key, None)
     if not state:
         return
-
     chat_id = state["chat_id"]
     user = state["sender"]
-    text_joined = "\n".join([t for t in state["texts"] if t]).strip()
-    if not text_joined:
-        text_joined = "[сообщение без текста]"
+    text_joined = "\n".join([t for t in state["texts"] if t]).strip() or "[сообщение без текста]"
 
     suggestions = await compose_suggestions(text_joined)
 
@@ -341,7 +301,6 @@ async def _agg_fire(key: str):
 
     sugs_display = [add_emoji(expand_links(s)) for s in suggestions]
 
-    # кликабельное имя
     sender_id = user.get("id")
     sender_name = user.get("first_name") or user.get("username") or "Участник"
     sender_link = f'<a href="tg://user?id={sender_id}">{html_escape(sender_name)}</a>'
@@ -356,7 +315,6 @@ async def _agg_fire(key: str):
         f"4) {html_escape(sugs_display[3])}"
     )
 
-    # Кнопки: «Отправить/Правка» для 1–4 + «Пропустить»
     keyboard = {
         "inline_keyboard": [
             [
@@ -375,9 +333,7 @@ async def _agg_fire(key: str):
                 {"text": "Отправить 4", "callback_data": f"s:{sid}:3"},
                 {"text": "✍ Правка 4",  "callback_data": f"e:{sid}:3"},
             ],
-            [
-                {"text": "🗑 Пропустить", "callback_data": f"x:{sid}"},
-            ],
+            [{"text": "🗑 Пропустить", "callback_data": f"x:{sid}"}],
         ]
     }
 
@@ -395,14 +351,11 @@ async def queue_user_piece(chat_id: int, user: Dict[str, Any], message_id: int, 
         st["timer"].cancel()
     st["timer"] = asyncio.create_task(_agg_fire(key))
 
-# -----------------------------
-# FastAPI
-# -----------------------------
 app = FastAPI()
 class UpdateModel(BaseModel):
     model_config = {"extra": "allow"}
 
-# опционально: горячая перезагрузка KB на старте
+# горячая перезагрузка KB/шаблонов на старте
 try:
     from kb import reload_kb as kb_reload
 except Exception:
@@ -445,6 +398,17 @@ async def http_reload_templates(admin: str):
         raise HTTPException(status_code=403, detail="forbidden")
     return await reload_templates()
 
+# НОВОЕ: подтягиваем данные из Sheets в Assistant (создаём/обновляем VS и Assistant)
+@app.get("/assist_sync")
+async def http_assist_sync(admin: str):
+    if admin != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        res = await sync_assistant_from_sheets()
+        return res
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/set_webhook")
 async def set_webhook(admin: str):
     if admin != ADMIN_TOKEN:
@@ -463,7 +427,6 @@ async def set_webhook_url(admin: str, url: str):
         r.raise_for_status()
         return r.json()
 
-# нормализация команд: /cmd и /cmd@username
 def _norm_cmd(t: str) -> str:
     if not t or not t.startswith("/"):
         return ""
@@ -477,7 +440,6 @@ async def webhook(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="forbidden")
     update = await request.json()
 
-    # ----- callback_query (кнопки)
     if "callback_query" in update:
         cbq = update["callback_query"]
         await answer_callback_query(cbq.get("id"), "Ок")
@@ -488,24 +450,16 @@ async def webhook(secret: str, request: Request):
         idx = 0
         if data_raw.startswith("s:"):
             try:
-                _, sid, idx_str = data_raw.split(":")
-                idx = int(idx_str)
-                action = "send"
-            except Exception:
-                action = None
+                _, sid, idx_str = data_raw.split(":"); idx = int(idx_str); action = "send"
+            except Exception: action = None
         elif data_raw.startswith("e:"):
             try:
-                _, sid, idx_str = data_raw.split(":")
-                idx = int(idx_str)
-                action = "edit"
-            except Exception:
-                action = None
+                _, sid, idx_str = data_raw.split(":"); idx = int(idx_str); action = "edit"
+            except Exception: action = None
         elif data_raw.startswith("x:"):
             try:
-                _, sid = data_raw.split(":")
-                action = "skip"
-            except Exception:
-                action = None
+                _, sid = data_raw.split(":"); action = "skip"
+            except Exception: action = None
 
         if not action or not sid:
             return {"ok": True}
@@ -513,16 +467,12 @@ async def webhook(secret: str, request: Request):
         curator_chat_id = cbq["message"]["chat"]["id"]
         curator_msg_id  = cbq["message"]["message_id"]
 
-        # для skip можно не лезть в БД, но подчистим сессию
         if action == "skip":
-            try:
-                await db_execute("DELETE FROM suggestion_sessions WHERE id=%s", sid)
-            except Exception:
-                pass
+            try: await db_execute("DELETE FROM suggestion_sessions WHERE id=%s", sid)
+            except Exception: pass
             await safe_delete_message(curator_chat_id, curator_msg_id)
             return {"ok": True}
 
-        # для send/edit нужна сессия
         row = await db_fetchrow(
             "SELECT chat_id, reply_to, s1, s2, s3, s4 FROM suggestion_sessions WHERE id=%s",
             sid
@@ -562,31 +512,24 @@ async def webhook(secret: str, request: Request):
 
         return {"ok": True}
 
-    # ----- обычные сообщения
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return {"ok": True}
 
-    chat = msg.get("chat", {})
-    chat_id = chat.get("id")
-    from_user = msg.get("from", {})
-    is_bot = from_user.get("is_bot", False)
+    chat = msg.get("chat", {}); chat_id = chat.get("id")
+    from_user = msg.get("from", {}); is_bot = from_user.get("is_bot", False)
     message_id = msg.get("message_id")
 
-    # команды
     text = msg.get("text") or msg.get("caption") or ""
     cmd = _norm_cmd(text)
     if cmd == "/id":
-        await send_message(chat_id, f"chat_id: {chat_id}")
-        return {"ok": True}
+        await send_message(chat_id, f"chat_id: {chat_id}"); return {"ok": True}
     if cmd == "/ping":
-        await send_message(chat_id, "pong")
-        return {"ok": True}
+        await send_message(chat_id, "pong"); return {"ok": True}
     if cmd == "/help":
         await send_message(chat_id, "Команды: /id, /ping, /help. В рабочем чате карточки генерятся автоматически.")
         return {"ok": True}
 
-    # приём правки из чата кураторов
     if SUGGESTIONS_CHAT_ID and chat_id == SUGGESTIONS_CHAT_ID and text:
         curator_id = from_user.get("id")
         wait_key = f"wait:{SUGGESTIONS_CHAT_ID}:{curator_id}"
@@ -597,21 +540,18 @@ async def webhook(secret: str, request: Request):
             await send_message(payload["chat_id"], text, reply_to=payload["reply_to"])
             return {"ok": True}
 
-    # --- рабочий чат: собираем контент (текст + медиа) и шлём карточку с задержкой
     if MAIN_CHAT_ID and chat_id == MAIN_CHAT_ID and not is_bot:
         label = media_marker(msg)
         if label and SUGGESTIONS_CHAT_ID:
             await copy_message(SUGGESTIONS_CHAT_ID, chat_id, message_id)
             await queue_user_piece(chat_id, from_user, message_id, label)
             return {"ok": True}
-
         if text and not cmd:
             await queue_user_piece(chat_id, from_user, message_id, text)
             return {"ok": True}
 
     return {"ok": True}
 
-# GC loop
 async def _gc_loop():
     while True:
         try:
