@@ -16,22 +16,9 @@ from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
 
 # импорт «знаний» (KB)
-from kb import SYSTEM_PROMPT, COURSE_HINTS, expand_links, rule_suggestions
-# опционально: горячая перезагрузка KB, если есть такая функция в kb.py
-try:
-    from kb import reload_kb as kb_reload
-except Exception:
-    async def kb_reload():
-        return {"ok": True, "rows": 0}
-
+from kb import SYSTEM_PROMPT, COURSE_HINTS, expand_links, rule_suggestions, get_kb_snippets
 # шаблоны (Google Sheets → CSV)
-try:
-    from templates import reload_templates, render_template
-except Exception:
-    async def reload_templates():
-        return {"ok": True, "count": 0}
-    def render_template(slug: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        return {}
+from templates import reload_templates, render_template, get_template_snippets
 
 # -----------------------------
 # ENV
@@ -46,6 +33,7 @@ OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME          = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
 AGG_WINDOW          = int(os.getenv("AGG_WINDOW", "8"))  # секунд для склейки сообщений
+RAG_MAX_SNIPPETS    = int(os.getenv("RAG_MAX_SNIPPETS", "12"))  # сколько фрагментов отдаём в контекст
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # -----------------------------
@@ -62,7 +50,8 @@ DDL_STATEMENTS = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         s1 TEXT NOT NULL,
         s2 TEXT NOT NULL,
-        s3 TEXT NOT NULL
+        s3 TEXT NOT NULL,
+        s4 TEXT NOT NULL DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_suggestion_sessions_created ON suggestion_sessions(created_at)",
@@ -73,6 +62,8 @@ DDL_STATEMENTS = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
+    # миграция на случай старой схемы без s4
+    "ALTER TABLE suggestion_sessions ADD COLUMN IF NOT EXISTS s4 TEXT NOT NULL DEFAULT ''",
 ]
 
 async def init_db():
@@ -85,7 +76,7 @@ async def init_db():
             DATABASE_URL,
             min_size=1,
             max_size=5,
-            open=False,  # важное отличие — руками открываем ниже
+            open=False,
             kwargs={"autocommit": True},
         )
         await POOL.open()
@@ -204,7 +195,7 @@ def add_emoji(text: str) -> str:
     return f"{EMOJI_DEFAULT} {text}"
 
 # -----------------------------
-# LLM: один «творческий» вариант
+# LLM: один «творческий» вариант (V3)
 # -----------------------------
 async def llm_one_variant(user_text: str) -> str:
     if not OPENAI_API_KEY:
@@ -217,7 +208,7 @@ async def llm_one_variant(user_text: str) -> str:
         "messages": [
             {"role": "system", "content":
                 "Ты ментор для современных художников. Отвечай кратко, по делу, дружелюбно. "
-                "Дай 1 вариант (2–3 коротких предложения), без плейсхолдеров, но с конкретными шагами/навигацией."},
+                "Дай 1 вариант (2–3 кратких предложения), без плейсхолдеров, но с конкретными шагами/навигацией."},
             {"role": "user", "content": f"Запрос художника: {user_text}"}
         ],
         "temperature": 0.6,
@@ -240,12 +231,84 @@ async def llm_one_variant(user_text: str) -> str:
             print("[LLM ONE ERROR]", e)
             return "Если кратко: сформулируйте ближайшую цель и вопрос к ней — поможем точечно на встрече или здесь."
 
-# Композит: 2 из базы + 1 из LLM
+# -----------------------------
+# LLM: RAG-вариант на базе нашей БЗ (V4)
+# -----------------------------
+_WORD_RX = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9#@_]+", re.U)
+
+def _rank_snippets(query: str, snippets: List[Dict[str,str]], top_k: int) -> List[Dict[str,str]]:
+    q_tokens = set(w.lower() for w in _WORD_RX.findall(query))
+    def score(sn):
+        t = sn["text"]
+        toks = _WORD_RX.findall(t.lower())
+        overlap = sum(1 for w in toks if w in q_tokens)
+        # лёгкий бонус за наличие ссылок/хэштегов — это часто полезные подсказки
+        bonus = 2 if ("http" in t or "#" in t or "<" in t and ">" in t) else 0
+        return overlap + bonus
+    ranked = sorted(snippets, key=score, reverse=True)
+    return ranked[:top_k]
+
+async def llm_rag_variant(user_text: str) -> str:
+    """Строит ответ строго на основе нашей базы (kb_rules + templates)."""
+    if not OPENAI_API_KEY:
+        return "По базе: посмотри <вводная>, анкета: <анкета>, правила: <правила>. Защиты: <база_защит>."
+
+    # собираем фрагменты из kb и всех шаблонов
+    snippets = get_kb_snippets() + get_template_snippets()
+    if not snippets:
+        return "По базе пока пусто. Если подскажешь контекст (модуль/вопрос), соберу ссылки из закрепа."
+
+    top = _rank_snippets(user_text, snippets, RAG_MAX_SNIPPETS)
+
+    # формируем компактный контекст
+    context_lines = []
+    for i, sn in enumerate(top, 1):
+        # уже подставим ссылки в kb-фрагментах; в шаблонах оставляем как есть
+        text = expand_links(sn["text"])
+        context_lines.append(f"[{i}] {text}")
+    context_block = "\n".join(context_lines)
+
+    system = (
+        "Ты куратор и отвечаешь ТОЛЬКО на основе предоставленного контекста.\n"
+        "Никаких новых ссылок или фактов не придумывай.\n"
+        "Отвечай кратко (2–4 предложения), по делу, дружелюбно, без вводных «здравствуйте».\n"
+        "Если уместно — используй уже имеющиеся ссылки из контекста. Плейсхолдеры не вставляй."
+    )
+    user = (
+        f"Запрос: {user_text}\n\n"
+        f"Контекст:\n{context_block}\n\n"
+        "Сформируй краткий ответ по делу."
+    )
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 220
+    }
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        try:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            text = (data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+            return text[:700] if text else "По базе подсказок: проверьте закреп и базовые ссылки."
+        except Exception as e:
+            print("[LLM RAG ERROR]", e)
+            return "По базе: <вводная>, <анкета>, <правила>, база защит: <база_защит>."
+
+# Композит: 2 из базы + 1 «живой» + 1 RAG
 async def compose_suggestions(user_text: str) -> List[str]:
     base = rule_suggestions(user_text)
-    llm3 = await llm_one_variant(user_text)
-    out = [base[0], base[1], llm3]
-    out = [s.replace("\n\n","\n").strip()[:600] for s in out]
+    v3 = await llm_one_variant(user_text)
+    v4 = await llm_rag_variant(user_text)
+    out = [base[0], base[1], v3, v4]
+    out = [s.replace("\n\n","\n").strip()[:700] for s in out]
     return out
 
 # -----------------------------
@@ -272,8 +335,8 @@ async def _agg_fire(key: str):
 
     sid = uuid.uuid4()
     await db_execute(
-        "INSERT INTO suggestion_sessions(id, chat_id, reply_to, s1, s2, s3) VALUES(%s,%s,%s,%s,%s,%s)",
-        str(sid), chat_id, state["first_id"], suggestions[0], suggestions[1], suggestions[2]
+        "INSERT INTO suggestion_sessions(id, chat_id, reply_to, s1, s2, s3, s4) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+        str(sid), chat_id, state["first_id"], suggestions[0], suggestions[1], suggestions[2], suggestions[3]
     )
 
     sugs_display = [add_emoji(expand_links(s)) for s in suggestions]
@@ -289,10 +352,11 @@ async def _agg_fire(key: str):
         "\n\nВарианты:\n"
         f"1) {html_escape(sugs_display[0])}\n\n"
         f"2) {html_escape(sugs_display[1])}\n\n"
-        f"3) {html_escape(sugs_display[2])}"
+        f"3) {html_escape(sugs_display[2])}\n\n"
+        f"4) {html_escape(sugs_display[3])}"
     )
 
-    # Кнопки: «Отправить/Правка» для 1–3 + «Пропустить»
+    # Кнопки: «Отправить/Правка» для 1–4 + «Пропустить»
     keyboard = {
         "inline_keyboard": [
             [
@@ -306,6 +370,10 @@ async def _agg_fire(key: str):
             [
                 {"text": "Отправить 3", "callback_data": f"s:{sid}:2"},
                 {"text": "✍ Правка 3",  "callback_data": f"e:{sid}:2"},
+            ],
+            [
+                {"text": "Отправить 4", "callback_data": f"s:{sid}:3"},
+                {"text": "✍ Правка 4",  "callback_data": f"e:{sid}:3"},
             ],
             [
                 {"text": "🗑 Пропустить", "callback_data": f"x:{sid}"},
@@ -334,10 +402,16 @@ app = FastAPI()
 class UpdateModel(BaseModel):
     model_config = {"extra": "allow"}
 
+# опционально: горячая перезагрузка KB на старте
+try:
+    from kb import reload_kb as kb_reload
+except Exception:
+    async def kb_reload():
+        return {"ok": True, "rows": 0}
+
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-    # на старте подгружаем KB и шаблоны (если доступны)
     try:
         await kb_reload()
     except Exception as e:
@@ -450,7 +524,7 @@ async def webhook(secret: str, request: Request):
 
         # для send/edit нужна сессия
         row = await db_fetchrow(
-            "SELECT chat_id, reply_to, s1, s2, s3 FROM suggestion_sessions WHERE id=%s",
+            "SELECT chat_id, reply_to, s1, s2, s3, s4 FROM suggestion_sessions WHERE id=%s",
             sid
         )
         if not row:
@@ -458,18 +532,18 @@ async def webhook(secret: str, request: Request):
             await send_message(curator_chat_id, "Сессия устарела. Сгенерируйте подсказки заново.")
             return {"ok": True}
 
-        chat_id, reply_to, s1, s2, s3 = row
-        suggestions = [s1, s2, s3]
+        chat_id, reply_to, s1, s2, s3, s4 = row
+        suggestions = [s1, s2, s3, s4]
 
         if action == "send":
-            text_to_send = add_emoji(expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0]))
+            text_to_send = add_emoji(expand_links(suggestions[idx] if 0 <= idx < 4 else suggestions[0]))
             await send_message(chat_id, text_to_send, reply_to=reply_to)
             await db_execute("DELETE FROM suggestion_sessions WHERE id=%s", sid)
             await safe_delete_message(curator_chat_id, curator_msg_id)
             return {"ok": True}
 
         if action == "edit":
-            text_to_edit = add_emoji(expand_links(suggestions[idx] if 0 <= idx < 3 else suggestions[0]))
+            text_to_edit = add_emoji(expand_links(suggestions[idx] if 0 <= idx < 4 else suggestions[0]))
             curator_id = cbq.get("from", {}).get("id")
             wait_key = f"wait:{curator_chat_id}:{curator_id}"
             payload = {"chat_id": chat_id, "reply_to": reply_to}
