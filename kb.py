@@ -70,7 +70,7 @@ _rows: List[Dict[str, Any]] = []
 _loaded_at: float = 0.0
 
 def _load_rows_from_text(text: str) -> List[Dict[str, Any]]:
-    if text.startswith("\ufeff"):
+    if text.startswith("\ufeff"):  # BOM
         text = text.lstrip("\ufeff")
     reader = csv.DictReader(io.StringIO(text))
     rows = []
@@ -97,7 +97,7 @@ async def reload_kb():
     if KB_CSV_URL:
         src = KB_CSV_URL
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(KB_CSV_URL, follow_redirects=True)  # <— ВАЖНО
+            r = await c.get(KB_CSV_URL, follow_redirects=True)
             r.raise_for_status()
             text = r.text
     else:
@@ -156,3 +156,16 @@ def rule_suggestions(user_text: str) -> List[str]:
         return [s1, s2]
 
     return _fallback_pair()
+
+# ---------- Экспорт фрагментов для RAG-варианта ----------
+def get_kb_snippets() -> List[Dict[str, str]]:
+    """Возвращает список фрагментов из kb_rules для RAG-ответа."""
+    out: List[Dict[str, str]] = []
+    for i, r in enumerate(_rows):
+        s1 = r.get("s1") or ""
+        s2 = r.get("s2") or ""
+        if s1:
+            out.append({"id": f"kb:{i}:s1", "text": expand_links(s1)})
+        if s2:
+            out.append({"id": f"kb:{i}:s2", "text": expand_links(s2)})
+    return out
