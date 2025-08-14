@@ -10,21 +10,14 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 
-# psycopg (бинарные колёса)
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg.types.json import Json
 
-# импорт «знаний» (KB) + RAG локальные фрагменты
 from kb import SYSTEM_PROMPT, COURSE_HINTS, expand_links, rule_suggestions, get_kb_snippets
-# шаблоны (Google Sheets → CSV)
 from templates import reload_templates, render_template, get_template_snippets
-# Assistants API (новое)
-from assistants import assistants_answer, sync_assistant_from_sheets
+from assistants import assistants_answer, sync_assistant_from_sheets, assistant_status
 
-# -----------------------------
-# ENV
-# -----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WEBHOOK_SECRET      = os.getenv("WEBHOOK_SECRET", "")
 ADMIN_TOKEN         = os.getenv("ADMIN_TOKEN", "")
@@ -34,14 +27,11 @@ SUGGESTIONS_CHAT_ID = int(os.getenv("SUGGESTIONS_CHAT_ID", "0") or 0)
 OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME          = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
-AGG_WINDOW          = int(os.getenv("AGG_WINDOW", "8"))  # секунд для склейки сообщений
-RAG_MAX_SNIPPETS    = int(os.getenv("RAG_MAX_SNIPPETS", "12"))  # для локального RAG
-ASSISTANT_ID        = os.getenv("ASSISTANT_ID", "")  # если задан — используем Assistants API
+AGG_WINDOW          = int(os.getenv("AGG_WINDOW", "8"))
+RAG_MAX_SNIPPETS    = int(os.getenv("RAG_MAX_SNIPPETS", "12"))
+ASSISTANT_ID        = os.getenv("ASSISTANT_ID", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# -----------------------------
-# DB (psycopg + async pool)
-# -----------------------------
 POOL: Optional[AsyncConnectionPool] = None
 
 DDL_STATEMENTS = [
@@ -97,9 +87,6 @@ async def db_fetchrow(query: str, *args):
             await cur.execute(query, args if args else None)
             return await cur.fetchone()
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def html_escape(s: str) -> str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
@@ -147,7 +134,6 @@ async def copy_message(to_chat: int, from_chat: int, msg_id: int):
     except Exception as e:
         print("[TG COPY ERROR]", e)
 
-# Определение типа медиа
 def media_marker(msg: Dict[str, Any]) -> Optional[str]:
     mapping = [
         ("photo", "[фото]"),
@@ -166,7 +152,6 @@ def media_marker(msg: Dict[str, Any]) -> Optional[str]:
             return label
     return None
 
-# --- ЭМОДЗИ ---
 EMOJI_RULES = [
     (["правил"], "📜"),
     (["анкета", "анкет"], "📝"),
@@ -195,9 +180,7 @@ def add_emoji(text: str) -> str:
             return f"{emoji} {text}"
     return f"{EMOJI_DEFAULT} {text}"
 
-# -----------------------------
-# LLM: «живой» вариант (V3)
-# -----------------------------
+# ---------- LLM v3 ----------
 async def llm_one_variant(user_text: str) -> str:
     if not OPENAI_API_KEY:
         return "Понимаю запрос. Давайте точечно: опишите, что сейчас в практике важнее — покажу, с чего начать именно вам."
@@ -230,9 +213,7 @@ async def llm_one_variant(user_text: str) -> str:
             print("[LLM ONE ERROR]", e)
             return "Если кратко: сформулируйте ближайшую цель и вопрос к ней — поможем точечно на встрече или здесь."
 
-# -----------------------------
-# V4: Assistants API (если ASSISTANT_ID задан), иначе локальный RAG
-# -----------------------------
+# ---------- v4: Assistants / локальный RAG ----------
 _WORD_RX = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9#@_]+", re.U)
 def _rank_snippets(query: str, snippets: List[Dict[str,str]], top_k: int) -> List[Dict[str,str]]:
     q_tokens = set(w.lower() for w in _WORD_RX.findall(query))
@@ -245,7 +226,6 @@ def _rank_snippets(query: str, snippets: List[Dict[str,str]], top_k: int) -> Lis
     return sorted(snippets, key=score, reverse=True)[:top_k]
 
 async def llm_rag_variant(user_text: str) -> str:
-    # 1) Если настроен ассистент — используем его
     if ASSISTANT_ID:
         try:
             out = await assistants_answer(user_text)
@@ -253,20 +233,14 @@ async def llm_rag_variant(user_text: str) -> str:
                 return out[:700]
         except Exception as e:
             print("[ASSISTANTS ERROR]", e)
-            # fallback ниже
-
-    # 2) Локальный RAG (по Sheets, без SDK)
     snippets = get_kb_snippets() + get_template_snippets()
     if not snippets:
         return "По базе пока пусто. Если подскажешь контекст (модуль/вопрос), соберу ссылки из закрепа."
-
     top = _rank_snippets(user_text, snippets, RAG_MAX_SNIPPETS)
     lines = [sn["text"] for sn in top[:6]]
-    # простой ответ: берём 1–2 самые релевантные строки и склеиваем
     ans = " ".join(lines[:2]).strip()
     return ans[:700] if ans else "Проверь закреп и базовые ссылки: <вводная>, <анкета>, <правила>, <база_защит>."
 
-# Композиция: 2 из базы + 1 «живой» + 1 (Assistants/локальный RAG)
 async def compose_suggestions(user_text: str) -> List[str]:
     base = rule_suggestions(user_text)
     v3 = await llm_one_variant(user_text)
@@ -274,9 +248,6 @@ async def compose_suggestions(user_text: str) -> List[str]:
     out = [base[0], base[1], v3, v4]
     return [s.replace("\n\n", "\n").strip()[:700] for s in out]
 
-# -----------------------------
-# Агрегатор и FastAPI (как было)
-# -----------------------------
 AGG: Dict[str, Dict[str, Any]] = {}
 
 def _agg_key(chat_id: int, user_id: int) -> str:
@@ -355,7 +326,6 @@ app = FastAPI()
 class UpdateModel(BaseModel):
     model_config = {"extra": "allow"}
 
-# горячая перезагрузка KB/шаблонов на старте
 try:
     from kb import reload_kb as kb_reload
 except Exception:
@@ -379,6 +349,27 @@ async def on_startup():
 async def health():
     return {"ok": True, "time": time.time()}
 
+@app.get("/assist_status")
+async def http_assist_status(admin: str):
+    if admin != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        st = await assistant_status()
+        st["ok"] = True
+        return st
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/assist_sync")
+async def http_assist_sync(admin: str):
+    if admin != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        res = await sync_assistant_from_sheets()
+        return res
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/initdb")
 async def initdb(admin: str):
     if admin != ADMIN_TOKEN:
@@ -397,17 +388,6 @@ async def http_reload_templates(admin: str):
     if admin != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="forbidden")
     return await reload_templates()
-
-# НОВОЕ: подтягиваем данные из Sheets в Assistant (создаём/обновляем VS и Assistant)
-@app.get("/assist_sync")
-async def http_assist_sync(admin: str):
-    if admin != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="forbidden")
-    try:
-        res = await sync_assistant_from_sheets()
-        return res
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 @app.get("/set_webhook")
 async def set_webhook(admin: str):
@@ -440,25 +420,47 @@ async def webhook(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="forbidden")
     update = await request.json()
 
+    # ----- callback_query -----
     if "callback_query" in update:
         cbq = update["callback_query"]
         await answer_callback_query(cbq.get("id"), "Ок")
         data_raw = cbq.get("data") or ""
 
+        # Панель ассистента
+        if data_raw == "as:sync":
+            res = await sync_assistant_from_sheets()
+            msg = "✅ Синхронизация завершена" if res.get("ok") else "❌ Ошибка синхронизации"
+            extra = []
+            if "assistant_id" in res: extra.append(f"assistant_id: {res['assistant_id']}")
+            if "vector_store_id" in res: extra.append(f"vector_store_id: {res['vector_store_id']}")
+            if "files_uploaded" in res: extra.append(f"files_uploaded: {res['files_uploaded']}")
+            if "error" in res: extra.append(f"error: {res['error']}")
+            await send_message(update["callback_query"]["message"]["chat"]["id"], msg + ("\n" + "\n".join(extra) if extra else ""))
+            return {"ok": True}
+
+        if data_raw == "as:status":
+            try:
+                st = await assistant_status()
+                txt = "ℹ️ Статус ассистента:\n" + "\n".join(
+                    f"{k}: {v}" for k, v in st.items()
+                )
+            except Exception as e:
+                txt = f"❌ Ошибка статуса: {e}"
+            await send_message(update["callback_query"]["message"]["chat"]["id"], txt)
+            return {"ok": True}
+
+        # Кнопки предложений
         action = None
         sid = None
         idx = 0
         if data_raw.startswith("s:"):
-            try:
-                _, sid, idx_str = data_raw.split(":"); idx = int(idx_str); action = "send"
+            try: _, sid, idx_str = data_raw.split(":"); idx = int(idx_str); action = "send"
             except Exception: action = None
         elif data_raw.startswith("e:"):
-            try:
-                _, sid, idx_str = data_raw.split(":"); idx = int(idx_str); action = "edit"
+            try: _, sid, idx_str = data_raw.split(":"); idx = int(idx_str); action = "edit"
             except Exception: action = None
         elif data_raw.startswith("x:"):
-            try:
-                _, sid = data_raw.split(":"); action = "skip"
+            try: _, sid = data_raw.split(":"); action = "skip"
             except Exception: action = None
 
         if not action or not sid:
@@ -512,6 +514,7 @@ async def webhook(secret: str, request: Request):
 
         return {"ok": True}
 
+    # ----- обычные сообщения -----
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return {"ok": True}
@@ -527,9 +530,24 @@ async def webhook(secret: str, request: Request):
     if cmd == "/ping":
         await send_message(chat_id, "pong"); return {"ok": True}
     if cmd == "/help":
-        await send_message(chat_id, "Команды: /id, /ping, /help. В рабочем чате карточки генерятся автоматически.")
+        await send_message(chat_id,
+            "Команды: /id, /ping, /assist — панель ассистента (обновить базу/статус). "
+            "В рабочем чате карточки генерятся автоматически."
+        )
         return {"ok": True}
 
+    # Панель ассистента — только в чате кураторов
+    if cmd == "/assist" and SUGGESTIONS_CHAT_ID and chat_id == SUGGESTIONS_CHAT_ID:
+        kb = {
+            "inline_keyboard": [[
+                {"text": "🔄 Обновить базу ассистента", "callback_data": "as:sync"},
+                {"text": "ℹ️ Статус базы",              "callback_data": "as:status"},
+            ]]
+        }
+        await send_message(chat_id, "Панель ассистента:", reply_markup=kb)
+        return {"ok": True}
+
+    # Приём правки
     if SUGGESTIONS_CHAT_ID and chat_id == SUGGESTIONS_CHAT_ID and text:
         curator_id = from_user.get("id")
         wait_key = f"wait:{SUGGESTIONS_CHAT_ID}:{curator_id}"
@@ -540,6 +558,7 @@ async def webhook(secret: str, request: Request):
             await send_message(payload["chat_id"], text, reply_to=payload["reply_to"])
             return {"ok": True}
 
+    # Рабочий чат
     if MAIN_CHAT_ID and chat_id == MAIN_CHAT_ID and not is_bot:
         label = media_marker(msg)
         if label and SUGGESTIONS_CHAT_ID:
