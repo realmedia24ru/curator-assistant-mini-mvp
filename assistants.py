@@ -1,23 +1,19 @@
 # assistants.py
 """
 Интеграция с OpenAI Assistants API:
-- собираем документы из Google Sheets (CSV) → временные файлы;
-- создаём/обновляем Vector Store и Assistant (инструмент file_search);
-- даём краткий ответ ассистента по базе (assistants_answer).
+- тянем Google Sheets (CSV) → формируем текстовые документы → грузим в Vector Store;
+- создаём/обновляем Assistant с инструментом file_search;
+- выдаём короткий ответ ассистента по базе;
+- отдаём статус ассистента/Vector Store.
 
-Требования к окружению (ENV):
+ENV:
   OPENAI_API_KEY
-  ASSISTANT_MODEL              (опц., по умолчанию MODEL_NAME)
-  ASSISTANT_ID                 (опц., если пусто — создадим и вернём id)
-  ASSISTANT_VECTOR_STORE_ID    (опц., если пусто — создадим и вернём id)
-  ASSISTANT_INSTRUCTIONS       (опц., короткие инструкции ассистенту)
-
-  KB_CSV_URL                   (CSV Google Sheets для kb_rules)
-  TPL_REMOTE_JSON              (JSON map вкладок-шаблонов: {"welcome": "...csv", ...})
-
-Публичные функции:
-  - sync_assistant_from_sheets() → dict  # для вызова из FastAPI эндпойнта /assist_sync
-  - assistants_answer(query: str) → str   # получить ответ ассистента (2–4 предложения)
+  ASSISTANT_MODEL
+  ASSISTANT_ID
+  ASSISTANT_VECTOR_STORE_ID
+  ASSISTANT_INSTRUCTIONS
+  KB_CSV_URL
+  TPL_REMOTE_JSON
 """
 
 import os
@@ -25,13 +21,11 @@ import io
 import csv
 import json
 import time
-import tempfile
 import asyncio
 from typing import List, Tuple, Dict
 
 import httpx
 from openai import OpenAI
-
 
 # -------------------- ENV --------------------
 
@@ -44,21 +38,19 @@ ASSISTANT_VECTOR_STORE_ID = os.getenv("ASSISTANT_VECTOR_STORE_ID", "")
 ASSISTANT_INSTRUCTIONS = os.getenv(
     "ASSISTANT_INSTRUCTIONS",
     "Ты — куратор программы по современному искусству. "
-    "Отвечай КОРОТКО (2–4 предложения), точно и дружелюбно. "
-    "Опирайся ТОЛЬКО на приложенные файлы (file_search). "
-    "Не выдумывай факты; если данных нет, попроси уточнение."
+    "Отвечай КОРОТКО (2–4 предложения), по делу и дружелюбно. "
+    "Опирайся ТОЛЬКО на прикреплённые файлы (file_search). "
+    "Не выдумывай фактов; если данных нет — попроси уточнить запрос."
 )
 
 KB_CSV_URL = os.getenv("KB_CSV_URL", "")
 TPL_REMOTE_JSON = os.getenv("TPL_REMOTE_JSON", "")
 
-
-# -------------------- Client (лениво) --------------------
+# -------------------- Client --------------------
 
 _client: OpenAI | None = None
 
 def _client_get() -> OpenAI:
-    """Лениво создаём клиента OpenAI."""
     global _client
     if _client is None:
         if not OPENAI_API_KEY:
@@ -66,13 +58,9 @@ def _client_get() -> OpenAI:
         _client = OpenAI(api_key=OPENAI_API_KEY)
     return _client
 
-
-# -------------------- Загрузка CSV из Google Sheets --------------------
+# -------------------- Google Sheets → docs --------------------
 
 async def _fetch_csv(url: str) -> str:
-    """
-    Тянем CSV с учётом редиректов; убираем BOM при наличии.
-    """
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.get(url, follow_redirects=True)
         r.raise_for_status()
@@ -82,15 +70,9 @@ async def _fetch_csv(url: str) -> str:
         return text
 
 async def _build_documents_from_sheets() -> List[Tuple[str, bytes]]:
-    """
-    Формируем набор текстовых документов для загрузки в Vector Store:
-      - kb_rules.txt из KB_CSV_URL
-      - tpl_<name>.txt для каждой вкладки из TPL_REMOTE_JSON
-    Каждый документ — простой текст (заголовки/разделы), чтобы ответы были цитатными.
-    """
     docs: List[Tuple[str, bytes]] = []
 
-    # kb_rules → kb_rules.txt
+    # kb_rules
     if KB_CSV_URL:
         csv_text = await _fetch_csv(KB_CSV_URL)
         reader = csv.DictReader(io.StringIO(csv_text))
@@ -112,7 +94,7 @@ async def _build_documents_from_sheets() -> List[Tuple[str, bytes]]:
             lines.append("")
         docs.append(("kb_rules.txt", ("\n".join(lines)).encode("utf-8")))
 
-    # templates → tpl_<name>.txt
+    # templates
     mapping = {}
     if TPL_REMOTE_JSON:
         try:
@@ -139,12 +121,7 @@ async def _build_documents_from_sheets() -> List[Tuple[str, bytes]]:
 
     return docs
 
-
 def _write_tempfiles(docs: List[Tuple[str, bytes]]) -> List[str]:
-    """
-    Сохраняем документы во временные файлы — SDK любит реальные файлы.
-    Возвращаем список путей.
-    """
     paths: List[str] = []
     for (name, data) in docs:
         path = os.path.join("/tmp", f"{int(time.time()*1000)}_{name}")
@@ -153,17 +130,12 @@ def _write_tempfiles(docs: List[Tuple[str, bytes]]) -> List[str]:
         paths.append(path)
     return paths
 
-
-# -------------------- Синхронизация ассистента/вектор-хранилища --------------------
+# -------------------- Sync VS/Assistant --------------------
 
 def _sync_openai_vector_store(paths: List[str]) -> Dict[str, str]:
-    """
-    Синхронная часть (в отдельном треде): создаём/обновляем Vector Store и Assistant.
-    Добавлена «страховочная» проверка, что установлен SDK openai >= 1.35 (есть beta.vector_stores).
-    """
     client = _client_get()
 
-    # Явная проверка поддержки vector_stores
+    # Проверка версии SDK
     beta = getattr(client, "beta", None)
     if beta is None or not hasattr(beta, "vector_stores"):
         import openai as _openai
@@ -173,12 +145,12 @@ def _sync_openai_vector_store(paths: List[str]) -> Dict[str, str]:
         )
 
     # 1) Vector Store
-    vs_id = ASSISTANT_VECTOR_STORE_ID
+    vs_id = os.getenv("ASSISTANT_VECTOR_STORE_ID", "") or ASSISTANT_VECTOR_STORE_ID
     if not vs_id:
         vs = client.beta.vector_stores.create(name=f"CuratorAssistantKB-{int(time.time())}")
         vs_id = vs.id
 
-    # 2) Загрузка файлов и привязка к Vector Store
+    # 2) Files → VS
     uploaded = 0
     for p in paths:
         with open(p, "rb") as fh:
@@ -187,7 +159,7 @@ def _sync_openai_vector_store(paths: List[str]) -> Dict[str, str]:
         uploaded += 1
 
     # 3) Assistant
-    a_id = ASSISTANT_ID
+    a_id = os.getenv("ASSISTANT_ID", "") or ASSISTANT_ID
     if not a_id:
         a = client.beta.assistants.create(
             name="Curator Assistant RAG",
@@ -198,7 +170,6 @@ def _sync_openai_vector_store(paths: List[str]) -> Dict[str, str]:
         )
         a_id = a.id
     else:
-        # обновляем привязки/модель/инструкции
         client.beta.assistants.update(
             assistant_id=a_id,
             model=ASSISTANT_MODEL,
@@ -206,14 +177,16 @@ def _sync_openai_vector_store(paths: List[str]) -> Dict[str, str]:
             tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
         )
 
+    # Обновим переменные процесса (чтобы сразу работало до перезапуска)
+    os.environ["ASSISTANT_ID"] = a_id
+    os.environ["ASSISTANT_VECTOR_STORE_ID"] = vs_id
+    global ASSISTANT_ID, ASSISTANT_VECTOR_STORE_ID
+    ASSISTANT_ID = a_id
+    ASSISTANT_VECTOR_STORE_ID = vs_id
+
     return {"assistant_id": a_id, "vector_store_id": vs_id, "files_uploaded": uploaded}
 
-
 async def sync_assistant_from_sheets() -> Dict[str, str]:
-    """
-    Публичная функция: подтягиваем Google Sheets → готовим документы → грузим в OpenAI.
-    Вызывать из FastAPI-эндпойнта /assist_sync.
-    """
     docs = await _build_documents_from_sheets()
     if not docs:
         return {"ok": False, "error": "no_docs_from_sheets"}
@@ -225,51 +198,64 @@ async def sync_assistant_from_sheets() -> Dict[str, str]:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# -------------------- Status / Answer --------------------
 
-# -------------------- Ответ ассистента --------------------
+def _assistant_status_sync() -> Dict[str, str]:
+    client = _client_get()
+    a_id = os.getenv("ASSISTANT_ID", "") or ASSISTANT_ID
+    vs_id = os.getenv("ASSISTANT_VECTOR_STORE_ID", "") or ASSISTANT_VECTOR_STORE_ID
+
+    out: Dict[str, str | int] = {}
+    if a_id:
+        a = client.beta.assistants.retrieve(a_id)
+        out["assistant_id"] = a_id
+        out["model"] = getattr(a, "model", None)
+    if vs_id:
+        total = 0
+        lst = client.beta.vector_stores.files.list(vector_store_id=vs_id, limit=100)
+        total += len(lst.data)
+        while getattr(lst, "has_more", False):
+            last = lst.data[-1].id
+            lst = client.beta.vector_stores.files.list(vector_store_id=vs_id, limit=100, after=last)
+            total += len(lst.data)
+        out["vector_store_id"] = vs_id
+        out["files_count"] = total
+    return out
+
+async def assistant_status() -> Dict[str, str]:
+    return await asyncio.to_thread(_assistant_status_sync)
 
 def _assistants_answer_sync(query: str) -> str:
-    """
-    Синхронный запрос к ассистенту: создаём thread, добавляем сообщение, запускаем run, ждём completion.
-    """
     client = _client_get()
-
     a_id = os.getenv("ASSISTANT_ID", "") or ASSISTANT_ID
     if not a_id:
         raise RuntimeError("ASSISTANT_ID is empty (сначала вызовите /assist_sync и сохраните id в ENV)")
 
     th = client.beta.threads.create()
     client.beta.threads.messages.create(thread_id=th.id, role="user", content=query)
-
     run = client.beta.threads.runs.create(
-        thread_id=th.id,
-        assistant_id=a_id,
-        instructions="Отвечай кратко (2–4 предложения) и только по файлам.",
+        thread_id=th.id, assistant_id=a_id,
+        instructions="Отвечай кратко (2–4 предложения) и только по файлам."
     )
-
-    # Poll результата
-    for _ in range(120):  # до ~90 сек
+    import time as _t
+    for _ in range(120):
         st = client.beta.threads.runs.retrieve(thread_id=th.id, run_id=run.id)
         if st.status in ("completed", "failed", "cancelled", "expired"):
             break
-        time.sleep(0.8)
-
+        _t.sleep(0.8)
     if st.status != "completed":
         raise RuntimeError(f"Assistants run status: {st.status}")
 
     msgs = client.beta.threads.messages.list(thread_id=th.id, order="desc", limit=10)
     for m in msgs.data:
         if m.role == "assistant":
-            parts: List[str] = []
+            parts = []
             for c in m.content:
                 if getattr(c, "type", "") == "text":
                     parts.append(c.text.value)
             if parts:
                 return parts[0].strip()
-
     return ""
 
-
 async def assistants_answer(query: str) -> str:
-    """Асинхронная обёртка над синхронным SDK."""
     return await asyncio.to_thread(_assistants_answer_sync, query)
