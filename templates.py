@@ -1,5 +1,5 @@
 import os, csv, io, json, time, httpx
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 TPL_REMOTE_JSON = os.getenv("TPL_REMOTE_JSON", "")
 
@@ -34,7 +34,7 @@ async def reload_templates():
     mapping = json.loads(TPL_REMOTE_JSON)  # {"welcome":"url", ...}
     async with httpx.AsyncClient(timeout=30) as c:
         for name, url in mapping.items():
-            r = await c.get(url, follow_redirects=True)  # <— ВАЖНО
+            r = await c.get(url, follow_redirects=True)
             r.raise_for_status()
             _load_csv_text(r.text, source=url)
     _LOADED_AT = time.time()
@@ -49,3 +49,16 @@ def render_template(slug: str, context: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         text = tpl["text"]
     return {"text": text, "parse_mode": tpl["parse_mode"]}
+
+# ---------- Экспорт фрагментов для RAG-варианта ----------
+def get_template_snippets() -> List[Dict[str, str]]:
+    """
+    Возвращает список фрагментов из всех шаблонов.
+    Мы используем их как справочник для RAG-ответа (только текст).
+    """
+    out: List[Dict[str, str]] = []
+    for slug, rec in _TPL.items():
+        txt = (rec.get("text") or "").strip()
+        if txt:
+            out.append({"id": f"tpl:{slug}", "text": txt})
+    return out
